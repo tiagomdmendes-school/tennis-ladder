@@ -150,6 +150,64 @@ class TestStandings(unittest.TestCase):
                         [s.player_id for s in table].index(2))
 
 
+class TestBracketRendering(unittest.TestCase):
+    """The draw is absolutely positioned over an SVG of connector lines, so
+    the geometry has to survive boxes that are taller than the nominal size."""
+
+    def setUp(self):
+        from ladder.storage import TournamentMatch, TournamentRound
+        from ladder.views import bracket_view
+
+        self.render = bracket_view
+        self.names = {1: "Cameron Brown", 2: "Alex Kim",
+                      3: "Chance Twomey", 4: "Pat Lowe"}
+        self.rounds = [TournamentRound(0, "Semi-finals", "2026-08-16"),
+                       TournamentRound(1, "Final", "2026-08-23")]
+        self.matches = [
+            TournamentMatch(1, 1, 0, 0, 1, 2, None, None, "ready"),
+            TournamentMatch(2, 1, 0, 1, 3, 4, None, None, "ready"),
+            TournamentMatch(3, 1, 1, 0, None, None, None, None, "pending"),
+        ]
+
+    def test_boxes_are_sized_by_content_not_pinned_to_a_fixed_height(self):
+        """A box gains a 'Find a time' line for the viewer's own match. With a
+        fixed height that line overflowed the border; min-height lets the box
+        grow, and translateY keeps it centred on its connector."""
+        html = self.render(self.rounds, self.matches, self.names,
+                           viewer_id=1, division=MS, match_format="one_set")
+        self.assertIn("min-height:", html)
+        self.assertNotRegex(html, r"class=\"bbox[^\"]*\"[^>]*height:\d+px;\"")
+
+    def test_the_viewer_gets_a_link_on_their_own_live_match(self):
+        html = self.render(self.rounds, self.matches, self.names,
+                           viewer_id=1, division=MS, match_format="one_set")
+        self.assertIn("Find a time", html)
+        self.assertIn("/find/2", html)          # links to the opponent
+
+    def test_no_link_on_other_peoples_matches(self):
+        html = self.render(self.rounds, self.matches, self.names,
+                           viewer_id=1, division=MS, match_format="one_set")
+        self.assertNotIn("/find/3", html)
+        self.assertNotIn("/find/4", html)
+
+    def test_an_anonymous_viewer_gets_no_links(self):
+        html = self.render(self.rounds, self.matches, self.names)
+        self.assertNotIn("Find a time", html)
+
+    def test_connector_lines_are_drawn_between_rounds(self):
+        html = self.render(self.rounds, self.matches, self.names)
+        self.assertIn("<path", html)
+        self.assertIn("<svg", html)
+
+    def test_round_names_and_deadlines_appear(self):
+        html = self.render(self.rounds, self.matches, self.names)
+        self.assertIn("Semi-finals", html)
+        self.assertIn("2026-08-16", html)
+
+    def test_an_empty_draw_says_so(self):
+        self.assertIn("No draw yet", self.render(self.rounds, [], self.names))
+
+
 class TestRunningATournament(unittest.TestCase):
     def setUp(self):
         self.svc, self.p = with_roster()

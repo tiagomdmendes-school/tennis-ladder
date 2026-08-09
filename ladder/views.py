@@ -173,7 +173,8 @@ table.grid.painting td.slot { cursor:pointer; }
 table.grid.painting { user-select:none; -webkit-user-select:none; }
 
 /* Knockout bracket: absolutely positioned boxes over an SVG of connectors. */
-.bbox { position:absolute; background:var(--surface); border:1px solid var(--border);
+.bbox { position:absolute; transform:translateY(-50%);
+  background:var(--surface); border:1px solid var(--border);
   border-left:3px solid var(--line); border-radius:8px; padding:6px 10px;
   font-size:13.5px; box-sizing:border-box; }
 .bbox.done { border-left-color:var(--good); }
@@ -727,8 +728,10 @@ def bracket_view(rounds: Sequence, matches: Sequence, names: dict, *,
     BOX_H, BOX_W, GAP_X = 56, 190, 46
     first_round = min(by_round)
     base_count = len(by_round[first_round])
-    PITCH = BOX_H + 18                       # vertical pitch in round one
-    height = max(base_count * PITCH, PITCH) + 34
+    # Pitch leaves room for a box that has grown a "Find a time" line, so a
+    # taller box never collides with its neighbour.
+    PITCH = BOX_H + 32
+    height = max(base_count * PITCH, PITCH) + 44
     width = len(rounds) * (BOX_W + GAP_X)
 
     # Centre of a box: round one is evenly spaced, and every later box sits
@@ -749,9 +752,9 @@ def bracket_view(rounds: Sequence, matches: Sequence, names: dict, *,
                f'by {esc(rnd.deadline)}</text>' if rnd.deadline else ""))
 
         for m in sorted(by_round.get(rnd.round_no, []), key=lambda x: x.slot):
-            top = centre(index, m.slot) - BOX_H / 2
-            boxes.append(_bracket_box(m, names, left, top, BOX_W, BOX_H,
-                                      viewer_id, division, match_format))
+            boxes.append(_bracket_box(m, names, left, centre(index, m.slot),
+                                      BOX_W, BOX_H, viewer_id, division,
+                                      match_format))
             # Line from this box across to its parent's edge.
             if index + 1 < len(rounds):
                 y = centre(index, m.slot)
@@ -769,7 +772,7 @@ def bracket_view(rounds: Sequence, matches: Sequence, names: dict, *,
 {''.join(boxes)}</div></div>"""
 
 
-def _bracket_box(match, names: dict, left: float, top: float, w: int, h: int,
+def _bracket_box(match, names: dict, left: float, middle: float, w: int, h: int,
                  viewer_id, division: str, match_format: str) -> str:
     is_bye = match.status == "bye"
     won = match.winner_id
@@ -791,8 +794,11 @@ def _bracket_box(match, names: dict, left: float, top: float, w: int, h: int,
                   f'{esc(division)}&format={esc(match_format)}">Find a time</a>')
 
     state = "done" if won else ("live" if match.is_ready else "waiting")
-    return (f'<div class="bbox {state}" style="left:{left}px;top:{top}px;'
-            f'width:{w}px;height:{h}px">'
+    # Positioned by its centre and translated up half its own height, so a box
+    # that grows a "Find a time" line stays lined up with its connector instead
+    # of spilling out of a fixed height.
+    return (f'<div class="bbox {state}" style="left:{left}px;top:{middle}px;'
+            f'width:{w}px;min-height:{h}px">'
             f'<div class="brow">{side(match.player_a)}</div>'
             f'<div class="brow">{side(match.player_b)}</div>{action}</div>')
 
