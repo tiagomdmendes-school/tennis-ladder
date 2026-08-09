@@ -198,15 +198,37 @@ List** (usually "Default Security List for vcn-…") → **Add Ingress Rules**:
 Add a second rule for `8000` too while you're testing; you can delete it once
 Caddy is running.
 
-**Firewall 2 — the instance's own iptables.** Oracle's Ubuntu images ship with
-local rules that drop everything except SSH, so the console rule alone does
+**Firewall 2 — the instance's own iptables.** Oracle's Ubuntu images ship with a
+`REJECT` rule at the end of the INPUT chain, so the console rule alone does
 nothing. On the server:
 
 ```bash
-sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 80 -j ACCEPT
-sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 443 -j ACCEPT
-sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 8000 -j ACCEPT
+sudo iptables -I INPUT -p tcp --dport 80 -j ACCEPT
+sudo iptables -I INPUT -p tcp --dport 443 -j ACCEPT
+sudo iptables -I INPUT -p tcp --dport 8000 -j ACCEPT
+
+sudo apt install -y iptables-persistent      # so it survives a reboot
 sudo netfilter-persistent save
+```
+
+`-I INPUT` with no rule number inserts at the **top** of the chain, which lands
+ahead of the REJECT whatever your chain looks like. (You'll see `-I INPUT 6`
+elsewhere online — tidier, but it assumes a specific chain layout and silently
+does nothing if yours differs.) Inspect it any time with
+`sudo iptables -L INPUT -n --line-numbers`.
+
+**Telling the two firewalls apart** — the failure looks different depending on
+which one is blocking, which saves a lot of guessing:
+
+| What you see | Which firewall |
+|---|---|
+| Page hangs, then "took too long" — no reply at all | Oracle **Security List** is dropping. Fix in the console. |
+| "No route to host" or an immediate refusal | Packets reached the box; the instance's **iptables** rejected them. Fix on the server. |
+
+From another machine you can test a single port without a browser:
+
+```bash
+timeout 5 bash -c 'cat < /dev/null > /dev/tcp/<public-ip>/8000' && echo OPEN || echo BLOCKED
 ```
 
 (On an Oracle Linux image it's `sudo firewall-cmd --permanent --add-port=80/tcp`
@@ -262,11 +284,15 @@ python3 /opt/tennis-ladder/run.py --data-dir /var/lib/tennis-ladder --port 8000
 ```
 
 Visit `http://<public-ip>:8000`. If that loads, both firewalls are right and the
-hard part is over. Stop it with Ctrl-C.
+hard part is over. Stop it with **Ctrl-C**.
 
-Now make it permanent — `/etc/systemd/system/ladder.service`:
+That run only lasted as long as your terminal did — close the SSH session and
+the ladder dies with it, and a reboot won't bring it back. `systemd` is Linux's
+service manager: it starts things at boot and restarts them if they crash. Paste
+this whole block to write the service file (no text editor needed):
 
-```ini
+```bash
+sudo tee /etc/systemd/system/ladder.service > /dev/null <<'EOF'
 [Unit]
 Description=Tennis Ladder
 After=network.target
@@ -279,13 +305,27 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
+EOF
 ```
 
+What it says: don't start before networking is up; run exactly the command you
+just typed by hand; run as `ubuntu` rather than root so a bug can't touch the
+system; and bring it straight back if it crashes.
+
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now ladder
-sudo systemctl status ladder        # should say "active (running)"
-journalctl -u ladder -f             # live logs, Ctrl-C to stop watching
+sudo systemctl daemon-reload         # re-read service files
+sudo systemctl enable --now ladder   # start now, and on every boot
+sudo systemctl status ladder         # should say "active (running)" — q to exit
+```
+
+Then **close your SSH session entirely** and load the site again. If it's still
+up, it's genuinely a service. Day-to-day commands:
+
+```bash
+sudo systemctl restart ladder   # after a git pull
+sudo systemctl stop ladder
+journalctl -u ladder -f         # live logs, Ctrl-C to stop watching
+journalctl -u ladder -n 50      # last 50 lines
 ```
 
 ### 2.7 HTTPS with a free hostname
