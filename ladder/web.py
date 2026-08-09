@@ -886,9 +886,13 @@ actual times between yourselves.</p>
                                f'&mdash; extend the round, or send someone '
                                f'through:<ul>{"".join(items)}</ul></div>')
 
+            # Built outside the f-string: a backslash inside an f-string
+            # expression is only legal from Python 3.12 (PEP 701), and this
+            # has to run on the 3.10 that ships with Ubuntu 22.04.
+            overdue_pill = '<span class="pill">overdue</span>'
             deadlines = "".join(
                 f'<tr><td>{esc(r.name)}</td><td>{esc(r.deadline or "&mdash;")}</td>'
-                f'<td>{"<span class=\'pill\'>overdue</span>" if r.is_overdue else ""}</td></tr>'
+                f'<td>{overdue_pill if r.is_overdue else ""}</td></tr>'
                 for r in rounds)
 
             body = f"""{overdue}<h1>{esc(tournament.name)}</h1>
