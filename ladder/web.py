@@ -680,11 +680,68 @@ opponent from the ladder and you'll be shown the overlaps.</p>
 
 <h2>You asked</h2>
 <div class="card">{request_rows(sched.outbox(viewer.id), names, viewer.id,
-                                req.csrf, 'outbox')}</div>
-
-<p class="sub">To ask someone, open their profile from a ladder and hit
-<b>Find a time</b>.</p>"""
+                                req.csrf, 'outbox')}
+<p style="margin:14px 0 0"><a class="btn small" href="/find">Ask someone for a
+match</a></p></div>"""
             return Response(app.render(req, "Matches", body, "schedule"))
+
+        @self.route("GET", "/find")
+        def find_anyone(req: Request) -> Response:
+            """Pick an opponent from a list, rather than hunting for their
+            profile page first."""
+            viewer = app.viewer(req)
+            if not viewer:
+                req.flash("warn", "Sign in to arrange a match.")
+                return redirect("/login")
+            sched = app.service.scheduler
+            others = [p for p in app.db.list_players(active_only=True)
+                      if p.id != viewer.id]
+            if not others:
+                body = ("<h1>Ask someone for a match</h1><p class='sub'>"
+                        "There's nobody else on the ladder yet.</p>")
+                return Response(app.render(req, "Ask for a match", body, "schedule"))
+
+            # Say who can actually be matched up, so nobody picks a name and
+            # then finds there's nothing to suggest.
+            options = []
+            for player in others:
+                ready = sched.has_availability(player.id)
+                options.append(
+                    f'<option value="{player.id}">{esc(player.name)}'
+                    f'{"" if ready else "  (no availability set)"}</option>')
+
+            formats = "".join(
+                f'<option value="{esc(key)}"'
+                f'{" selected" if key == app.config.default_match_format else ""}>'
+                f'{esc(spec["label"])} (~{spec["minutes"]} min)</option>'
+                for key, spec in app.config.match_formats.items())
+            divisions = "".join(
+                f'<option value="{key}">{esc(div.get(key).label)}</option>'
+                for key in app.enabled())
+
+            body = f"""<h1>Ask someone for a match</h1>
+<p class="sub">Pick who you want to play and you'll be shown the times you're
+both free.</p>
+<div class="card"><form class="stack" method="get" action="/find/go">
+<div><label for="opponent">Opponent</label>
+<select id="opponent" name="opponent">{''.join(options)}</select></div>
+<div><label for="division">Division</label>
+<select id="division" name="division">{divisions}</select></div>
+<div><label for="format">Format</label>
+<select id="format" name="format">{formats}</select></div>
+<div class="row"><button type="submit">Find times</button>
+<a class="btn ghost" href="/schedule">Back</a></div>
+</form></div>"""
+            return Response(app.render(req, "Ask for a match", body, "schedule"))
+
+        @self.route("GET", "/find/go")
+        def find_go(req: Request) -> Response:
+            opponent = req.get_int("opponent")
+            if opponent is None:
+                return redirect("/find")
+            query = urllib.parse.urlencode({
+                "division": req.get("division"), "format": req.get("format")})
+            return redirect(f"/find/{opponent}?{query}")
 
         @self.route("GET", r"/find/(\d+)")
         def find_time(req: Request, player_id: str) -> Response:
@@ -835,7 +892,11 @@ actual times between yourselves.</p>
 
             if tournament.style == T.ELIMINATION:
                 main = ('<h2>Draw</h2><div class="card">'
-                        + bracket_view(rounds, matches, names) + "</div>")
+                        + bracket_view(rounds, matches, names,
+                                       viewer_id=viewer.id if viewer else None,
+                                       division=tournament.division,
+                                       match_format=tournament.match_format)
+                        + "</div>")
             else:
                 main = ('<h2>Standings</h2><div class="card">'
                         + standings_table(app.service.tournament_standings(tournament.id),
@@ -1096,6 +1157,14 @@ new one.</p>
       <input type="hidden" name="player_id" value="''' + str(p.id) + '''">
       <button class="small ghost" name="action" value="clearpin">Clear PIN</button>
     </form>''' if p.pin_set else ''}
+    <form method="post" action="/admin/player" class="row" style="margin:0;gap:4px"
+          onsubmit="return confirm('Permanently delete {esc(p.name)} and every match they played? This cannot be undone.')">
+      <input type="hidden" name="csrf" value="{esc(req.csrf)}">
+      <input type="hidden" name="player_id" value="{p.id}">
+      <input name="confirm" placeholder="DELETE" style="width:88px"
+             aria-label="Type DELETE to confirm">
+      <button class="small danger" name="action" value="destroy">Delete</button>
+    </form>
   </div></td></tr>""" for p in players) or \
                 '<tr><td colspan="5" class="empty">No players yet.</td></tr>'
 
@@ -1122,16 +1191,31 @@ new one.</p>
                 for p in players if p.active) or \
                 '<p class="empty">Add some players first.</p>'
             current = app.db.current_season()
+            current_mark = "<b>current</b>"
+            deletable = len(seasons) > 1
             season_rows = "".join(
                 f'<tr><td class="name">{esc(s.name)}</td><td>{esc(s.starts_on)}</td>'
-                f'<td>{esc(s.ends_on or "&mdash;")}</td>'
-                f'<td>{"<b>current</b>" if s.is_current else ""}</td></tr>'
+                f'<td>{current_mark if s.is_current else ""}</td>'
+                f'<td>' + (f"""<form method="post" action="/admin/season" class="row"
+     style="margin:0;gap:4px" onsubmit="return confirm('Permanently delete {esc(s.name)} and all its matches?')">
+  <input type="hidden" name="csrf" value="{esc(req.csrf)}">
+  <input type="hidden" name="season_id" value="{s.id}">
+  <input name="confirm" placeholder="DELETE" style="width:88px"
+         aria-label="Type DELETE to confirm">
+  <button class="small danger" name="action" value="destroy">Delete</button>
+</form>""" if deletable else '<span class="hint">only season</span>')
+                + "</td></tr>"
                 for s in seasons)
 
             body = f"""<h1>Admin</h1>
 <p class="sub">Deactivating a player keeps their history and removes them from
 the ladders &mdash; that's what to do when someone graduates. Deleting a match
 recalculates every rating that came after it.</p>
+<div class="flash warn"><b>Delete</b> buttons erase permanently: a player takes
+every match they played with them, which changes their opponents' records too,
+and a season takes its matches and tournaments. There's no undo, so they're
+there for clearing out test data. For a real player who has left, use
+<b>Deactivate</b>.</div>
 
 <div class="grid2">
 <div class="card"><h2 style="margin-top:0">Add a player</h2>
@@ -1149,7 +1233,7 @@ recalculates every rating that came after it.</p>
 </form></div>
 
 <div class="card"><h2 style="margin-top:0">Seasons</h2>
-<div class="scroll"><table><thead><tr><th>Season</th><th>From</th><th>To</th>
+<div class="scroll"><table><thead><tr><th>Season</th><th>From</th><th></th>
 <th></th></tr></thead><tbody>{season_rows}</tbody></table></div>
 <form class="stack" method="post" action="/admin/season" style="margin-top:14px"
   onsubmit="return confirm('Start a new season? Ratings carry over with widened uncertainty.')">
@@ -1263,6 +1347,17 @@ pick a new one.</p>
                 app.db.clear_pin(player.id)
                 req.flash("ok", f"Cleared {esc(player.name)}'s PIN. They'll "
                                 "choose a new one next time they sign in.")
+            elif action == "destroy":
+                if req.get("confirm").strip().upper() != "DELETE":
+                    req.flash("err", "Type DELETE in the box to confirm.")
+                    return redirect("/admin")
+                name = player.name
+                removed = app.service.delete_player_completely(player.id)
+                req.flash("ok", f"Deleted {esc(name)} permanently, along with "
+                                f"{removed['matches']} match"
+                                f"{'es' if removed['matches'] != 1 else ''} and "
+                                f"{removed['requests']} request"
+                                f"{'s' if removed['requests'] != 1 else ''}.")
             return redirect("/admin")
 
         @self.route("POST", "/admin/season")
@@ -1270,6 +1365,22 @@ pick a new one.</p>
             if not app.require_admin(req) or not req.check_csrf():
                 req.flash("err", "Admin access required.")
                 return redirect("/login")
+            if req.get("action") == "destroy":
+                if req.get("confirm").strip().upper() != "DELETE":
+                    req.flash("err", "Type DELETE in the box to confirm.")
+                    return redirect("/admin")
+                season_id = req.get_int("season_id")
+                season = app.db.get_season(season_id or 0)
+                if not season:
+                    return redirect("/admin")
+                removed = app.service.delete_season_completely(season.id)
+                req.flash("ok", f"Deleted {esc(season.name)} permanently, with "
+                                f"{removed['matches']} match"
+                                f"{'es' if removed['matches'] != 1 else ''} and "
+                                f"{removed['tournaments']} tournament"
+                                f"{'s' if removed['tournaments'] != 1 else ''}.")
+                return redirect("/admin")
+
             season = app.service.start_season(req.get("name"))
             req.flash("ok", f"{esc(season.name)} started. Ratings carried over "
                             "with widened uncertainty; past seasons stay readable.")

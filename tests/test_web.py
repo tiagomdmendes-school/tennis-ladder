@@ -699,6 +699,128 @@ class TestTournamentPages(WebTestCase):
         self.assertEqual(self.get("/tournament/999")[0], 404)
 
 
+class TestHardDeletes(WebTestCase):
+    """Permanent deletion, for clearing out test data.
+
+    Distinct from deactivating, which is what a graduating player gets: this
+    removes the rows entirely and takes their opponents' matches with them.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.roster()
+        self.app.service.submit_result(
+            division=MS, side_a=[self.al.id], side_b=[self.bo.id],
+            score_text="6-2", played_on=days_ago(5), auto_confirm=True)
+        self.login_admin()
+
+    def test_deleting_a_player_removes_them_and_their_matches(self):
+        self.post("/admin/player", {"csrf": self.csrf("/admin"),
+                                    "action": "destroy",
+                                    "player_id": self.al.id,
+                                    "confirm": "DELETE"})
+        self.assertIsNone(self.db.get_player(self.al.id))
+        self.assertEqual(self.db.list_matches(), [])
+        # The opponent survives, with the shared match gone from their record.
+        self.assertIsNotNone(self.db.get_player(self.bo.id))
+        self.assertEqual(self.app.service.engine.ladder(MS).entries, [])
+
+    def test_deleting_a_player_clears_their_availability_and_requests(self):
+        self.db.set_weekly_availability(self.al.id, {1: [(900, 1080)]})
+        self.db.add_match_request(
+            division=MS, from_player=self.al.id, to_player=self.bo.id,
+            starts_at="2027-01-01T10:00", minutes=60, match_format="one_set")
+        self.post("/admin/player", {"csrf": self.csrf("/admin"),
+                                    "action": "destroy",
+                                    "player_id": self.al.id,
+                                    "confirm": "DELETE"})
+        self.assertEqual(self.db.list_match_requests(), [])
+        self.assertNotIn(self.al.id, self.db.players_with_availability())
+
+    def test_deletion_needs_the_typed_confirmation(self):
+        _, body, _ = self.post("/admin/player", {
+            "csrf": self.csrf("/admin"), "action": "destroy",
+            "player_id": self.al.id, "confirm": "yes"})
+        self.assertTrue(self.flashes(body, "err"))
+        self.assertIsNotNone(self.db.get_player(self.al.id))
+
+    def test_a_non_admin_cannot_delete_a_player(self):
+        self.get("/logout")
+        self.login_as(self.bo, self.bo_pin)
+        self.post("/admin/player", {"csrf": self.csrf("/schedule"),
+                                    "action": "destroy",
+                                    "player_id": self.al.id,
+                                    "confirm": "DELETE"})
+        self.assertIsNotNone(self.db.get_player(self.al.id))
+
+    def test_deleting_a_season_removes_its_matches(self):
+        first = self.db.current_season()
+        self.app.service.start_season("Season 2")
+        self.post("/admin/season", {"csrf": self.csrf("/admin"),
+                                    "action": "destroy",
+                                    "season_id": first.id,
+                                    "confirm": "DELETE"})
+        self.assertIsNone(self.db.get_season(first.id))
+        self.assertEqual(self.db.list_matches(), [])
+
+    def test_the_only_season_cannot_be_deleted(self):
+        only = self.db.current_season()
+        _, body, _ = self.post("/admin/season", {
+            "csrf": self.csrf("/admin"), "action": "destroy",
+            "season_id": only.id, "confirm": "DELETE"})
+        self.assertTrue(self.flashes(body, "err"))
+        self.assertIsNotNone(self.db.get_season(only.id))
+
+    def test_a_current_season_always_remains(self):
+        first = self.db.current_season()
+        second = self.app.service.start_season("Season 2")
+        self.post("/admin/season", {"csrf": self.csrf("/admin"),
+                                    "action": "destroy",
+                                    "season_id": second.id,
+                                    "confirm": "DELETE"})
+        self.assertEqual(self.db.current_season().id, first.id)
+
+    def test_deleting_a_season_takes_its_tournaments(self):
+        season = self.db.current_season()
+        self.app.service.create_tournament(
+            name="Cup", division=MS, style="round_robin", seeding="random",
+            match_format="one_set",
+            player_ids=[self.al.id, self.bo.id, self.cy.id])
+        self.app.service.start_season("Season 2")
+        self.post("/admin/season", {"csrf": self.csrf("/admin"),
+                                    "action": "destroy",
+                                    "season_id": season.id,
+                                    "confirm": "DELETE"})
+        self.assertEqual(self.db.list_tournaments(), [])
+
+
+class TestOpponentPicker(WebTestCase):
+    def setUp(self):
+        super().setUp()
+        self.roster()
+        self.login_as(self.al, self.al_pin)
+
+    def test_the_picker_lists_everyone_but_you(self):
+        _, body, _ = self.get("/find")
+        self.assertIn("Bo", body)
+        self.assertNotIn(f'<option value="{self.al.id}">', body)
+
+    def test_it_flags_who_has_no_availability(self):
+        self.db.set_weekly_availability(self.bo.id, {1: [(900, 1080)]})
+        _, body, _ = self.get("/find")
+        self.assertIn("no availability set", body)
+
+    def test_choosing_someone_lands_on_their_find_page(self):
+        _, body, url = self.get(
+            f"/find/go?opponent={self.bo.id}&division={MS}&format=one_set")
+        self.assertIn(f"/find/{self.bo.id}", url)
+        self.assertIn("Play Bo", body)
+
+    def test_the_schedule_page_links_to_the_picker(self):
+        _, body, _ = self.get("/schedule")
+        self.assertIn('href="/find"', body)
+
+
 class TestPlayerPage(WebTestCase):
     def setUp(self):
         super().setUp()

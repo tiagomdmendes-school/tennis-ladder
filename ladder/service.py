@@ -403,6 +403,33 @@ class LadderService:
         self._notify("season_started", season=season)
         return season
 
+    # ------------------------------------------------------- destructive ops
+    def delete_player_completely(self, player_id: int) -> dict:
+        player = self.db.get_player(player_id)
+        if not player:
+            raise ServiceError("That player no longer exists.")
+        removed = self.db.delete_player_completely(player_id)
+        self.engine.invalidate()
+        return removed
+
+    def delete_season_completely(self, season_id: int) -> dict:
+        season = self.db.get_season(season_id)
+        if not season:
+            raise ServiceError("That season no longer exists.")
+        if self.db.season_count() <= 1:
+            raise ServiceError(
+                "That's the only season -- deleting it would leave nowhere to "
+                "record results. Start a new season first.")
+        removed = self.db.delete_season_completely(season_id)
+        self.engine.invalidate()
+        return removed
+
+    def delete_tournament(self, tournament_id: int) -> None:
+        if not self.db.get_tournament(tournament_id):
+            raise ServiceError("That tournament no longer exists.")
+        self.db.delete_tournament(tournament_id)
+        self.engine.invalidate()
+
     # --------------------------------------------------------------- players
     def add_player(self, name: str, email: str = "", pin: str = "",
                    category: str = div.UNSPECIFIED) -> Player:

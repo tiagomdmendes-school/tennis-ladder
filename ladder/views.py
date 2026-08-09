@@ -149,9 +149,40 @@ figcaption { color:var(--ink-2); font-size:13px; margin-bottom:10px; }
 .chem.pos { color:var(--good-ink); }
 .chem.neg { color:var(--critical); }
 
-table.grid td, table.grid th { padding:3px 6px; border-bottom:1px solid var(--grid); }
-table.grid input[type=checkbox] { margin:0; width:18px; height:18px; }
-table.grid th { text-align:center; }
+/* Availability grid. Half-hour rows, so it has to stay compact. */
+table.grid { border-collapse:separate; border-spacing:2px; }
+table.grid th { text-align:center; padding:0 0 4px; }
+table.grid td.tlabel { padding:0 8px 0 0; text-align:right; white-space:nowrap;
+  color:var(--muted); font-size:11.5px; font-variant-numeric:tabular-nums;
+  border:none; height:15px; }
+table.grid td.slot { padding:0; width:13%; height:15px; border:none;
+  border-radius:3px; background:var(--plane);
+  box-shadow:inset 0 0 0 1px var(--grid); }
+table.grid td.slot.on { background:var(--series-1);
+  box-shadow:inset 0 0 0 1px var(--series-1); }
+table.grid input[type=checkbox] { margin:0; width:100%; height:15px; }
+button.daytoggle { background:none; border:none; padding:2px 4px; width:auto;
+  color:var(--muted); font-size:12px; font-weight:600; letter-spacing:.04em;
+  text-transform:uppercase; cursor:pointer; }
+button.daytoggle:hover { color:var(--ink); }
+/* Once the script is running the boxes are redundant -- the cell is the
+   control -- so hide them but keep them in the form. */
+table.grid.painting input[type=checkbox] { position:absolute; opacity:0;
+  pointer-events:none; }
+table.grid.painting td.slot { cursor:pointer; }
+table.grid.painting { user-select:none; -webkit-user-select:none; }
+
+/* Knockout bracket: absolutely positioned boxes over an SVG of connectors. */
+.bbox { position:absolute; background:var(--surface); border:1px solid var(--border);
+  border-left:3px solid var(--line); border-radius:8px; padding:6px 10px;
+  font-size:13.5px; box-sizing:border-box; }
+.bbox.done { border-left-color:var(--good); }
+.bbox.live { border-left-color:var(--series-1); }
+.bbox .brow { white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  line-height:1.55; }
+.bbox a.bwin { font-weight:700; color:var(--ink); }
+.bbox a.bfind { display:block; font-size:11px; margin-top:1px; }
+
 h3 { font-size:15px; margin:20px 0 8px; }
 """
 
@@ -174,7 +205,7 @@ def page(
     links = [
         nav_link("/", "ladder", "Ladders"),
         nav_link("/tournaments", "tournaments", "Tournaments"),
-        nav_link("/schedule", "schedule", "Arrange"),
+        nav_link("/schedule", "schedule", "Matches"),
         nav_link("/availability", "availability", "My times"),
         nav_link("/submit", "submit", "Submit"),
         nav_link("/pending", "pending", "Confirm"),
@@ -471,28 +502,109 @@ doesn't know how hard the matches were.</p>"""
 
 # -------------------------------------------------------------- availability
 def availability_grid(weekly: dict, blocks: Sequence[tuple]) -> str:
-    """The 'usual week' grid: tick the blocks you're normally free.
+    """The 'usual week' grid: drag across the times you're normally free.
 
-    Deliberately coarse. Nobody fills in a 15-minute planner, and a rough
-    pattern plus one-tap exceptions beats an exact one nobody updates.
+    Checkboxes are the real inputs, so the form submits and works with no
+    JavaScript at all -- but at half-hour resolution that's 200 boxes, which
+    nobody is going to tick one at a time. The script below paints across them
+    by dragging, and a click on a day name toggles the whole column. The
+    checkboxes are visually hidden once the script runs, so what you actually
+    see is a block of coloured cells.
     """
-    header = "".join(f"<th>{esc(day)}</th>" for day in av.WEEKDAY_SHORT)
+    header = "".join(
+        f'<th><button type="button" class="daytoggle" data-day="{index}">'
+        f"{esc(day)}</button></th>"
+        for index, day in enumerate(av.WEEKDAY_SHORT))
     rows = []
     for start, end in blocks:
         cells = []
         for weekday in range(7):
-            checked = " checked" if av.covers(weekly.get(weekday, []), (start, end)) else ""
+            on = av.covers(weekly.get(weekday, []), (start, end))
             cells.append(
-                f'<td style="text-align:center;padding:4px">'
+                f'<td class="slot{" on" if on else ""}" data-day="{weekday}">'
                 f'<input type="checkbox" name="slot" '
-                f'value="{weekday}-{start}-{end}"{checked} '
+                f'value="{weekday}-{start}-{end}"{" checked" if on else ""} '
                 f'aria-label="{esc(av.WEEKDAYS[weekday])} {esc(av.clock(start))}">'
                 f"</td>")
-        rows.append(
-            f'<tr><td style="white-space:nowrap;color:var(--ink-2);font-size:13px">'
-            f"{esc(av.clock(start))}</td>{''.join(cells)}</tr>")
-    return (f'<div class="scroll"><table class="grid"><thead><tr><th></th>{header}'
-            f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>")
+        # Only label the hour, so the half-hour rows read as subdivisions.
+        label = esc(av.clock(start)) if start % 60 == 0 else ""
+        rows.append(f'<tr><td class="tlabel">{label}</td>{"".join(cells)}</tr>')
+
+    return f"""<div class="scroll"><table class="grid" id="availgrid">
+<thead><tr><th></th>{header}</tr></thead>
+<tbody>{''.join(rows)}</tbody></table></div>
+<p class="hint" id="availhelp">Tick the times you're usually free.</p>
+<script>{_GRID_SCRIPT}</script>"""
+
+
+# Drag-painting over the grid. Kept deliberately small and dependency-free;
+# without it the plain checkboxes still work.
+_GRID_SCRIPT = """
+(function () {
+  var grid = document.getElementById('availgrid');
+  if (!grid) return;
+  grid.classList.add('painting');
+  var help = document.getElementById('availhelp');
+  if (help) help.textContent =
+    'Drag across the times you are usually free. Click a day name to toggle the whole column.';
+
+  var down = false, turnOn = true;
+  function box(cell) { return cell.querySelector('input'); }
+  function paint(cell) {
+    var input = box(cell);
+    if (!input) return;
+    input.checked = turnOn;
+    cell.classList.toggle('on', turnOn);
+  }
+  function cellFrom(target) {
+    return target && target.closest ? target.closest('td.slot') : null;
+  }
+
+  grid.addEventListener('mousedown', function (e) {
+    var cell = cellFrom(e.target);
+    if (!cell) return;
+    e.preventDefault();
+    down = true;
+    turnOn = !box(cell).checked;
+    paint(cell);
+  });
+  grid.addEventListener('mouseover', function (e) {
+    if (!down) return;
+    var cell = cellFrom(e.target);
+    if (cell) paint(cell);
+  });
+  document.addEventListener('mouseup', function () { down = false; });
+
+  // Touch: same idea, but coordinates have to be resolved by hand.
+  grid.addEventListener('touchstart', function (e) {
+    var cell = cellFrom(e.target);
+    if (!cell) return;
+    down = true;
+    turnOn = !box(cell).checked;
+    paint(cell);
+    e.preventDefault();
+  }, {passive: false});
+  grid.addEventListener('touchmove', function (e) {
+    if (!down) return;
+    var touch = e.touches[0];
+    var cell = cellFrom(document.elementFromPoint(touch.clientX, touch.clientY));
+    if (cell) paint(cell);
+    e.preventDefault();
+  }, {passive: false});
+  document.addEventListener('touchend', function () { down = false; });
+
+  grid.addEventListener('click', function (e) {
+    var toggle = e.target.closest ? e.target.closest('.daytoggle') : null;
+    if (!toggle) return;
+    e.preventDefault();
+    var day = toggle.getAttribute('data-day');
+    var cells = grid.querySelectorAll('td.slot[data-day="' + day + '"]');
+    var allOn = Array.prototype.every.call(cells, function (c) { return box(c).checked; });
+    turnOn = !allOn;
+    Array.prototype.forEach.call(cells, paint);
+  });
+})();
+"""
 
 
 def upcoming_days(
@@ -596,47 +708,93 @@ def request_rows(requests: Sequence, names: dict, viewer_id: int, csrf: str,
 
 
 # -------------------------------------------------------------- tournaments
-def bracket_view(rounds: Sequence, matches: Sequence, names: dict) -> str:
-    """Knockout draw, one column per round."""
+def bracket_view(rounds: Sequence, matches: Sequence, names: dict, *,
+                 viewer_id: Optional[int] = None, division: str = "",
+                 match_format: str = "") -> str:
+    """A knockout draw drawn as a real bracket.
+
+    Each match is a fixed-height box and the rounds are laid out so a pair in
+    one round sits either side of its parent in the next. Connector lines are
+    drawn as one SVG behind the boxes, which is what makes it read as a bracket
+    rather than three lists side by side.
+    """
     by_round: dict = {}
     for m in matches:
         by_round.setdefault(m.round_no, []).append(m)
+    if not by_round:
+        return '<p class="empty">No draw yet.</p>'
 
-    columns = []
-    for rnd in rounds:
-        cells = []
-        for m in sorted(by_round.get(rnd.round_no, []), key=lambda x: x.slot):
-            cells.append(_bracket_cell(m, names))
-        overdue = (' <span class="pill" style="color:var(--critical)">overdue</span>'
+    BOX_H, BOX_W, GAP_X = 56, 190, 46
+    first_round = min(by_round)
+    base_count = len(by_round[first_round])
+    PITCH = BOX_H + 18                       # vertical pitch in round one
+    height = max(base_count * PITCH, PITCH) + 34
+    width = len(rounds) * (BOX_W + GAP_X)
+
+    # Centre of a box: round one is evenly spaced, and every later box sits
+    # midway between the two it is fed by.
+    def centre(round_index: int, slot: int) -> float:
+        span = PITCH * (2 ** round_index)
+        return 34 + span * slot + span / 2
+
+    lines, boxes, headers = [], [], []
+    for index, rnd in enumerate(rounds):
+        left = index * (BOX_W + GAP_X)
+        overdue = (' <tspan fill="var(--critical)">overdue</tspan>'
                    if rnd.is_overdue else "")
-        deadline = (f'<div class="hint">by {esc(rnd.deadline)}</div>'
-                    if rnd.deadline else "")
-        columns.append(
-            f'<div style="min-width:200px;flex:1">'
-            f'<h3 style="font-size:14px;margin:0 0 4px">{esc(rnd.name)}{overdue}</h3>'
-            f"{deadline}{''.join(cells)}</div>")
-    return (f'<div class="scroll"><div style="display:flex;gap:16px;'
-            f'align-items:flex-start;min-width:min-content">'
-            f"{''.join(columns)}</div></div>")
+        headers.append(
+            f'<text x="{left}" y="16" font-size="12" font-weight="600" '
+            f'fill="var(--ink-2)">{esc(rnd.name)}{overdue}</text>'
+            + (f'<text x="{left}" y="30" font-size="11" fill="var(--muted)">'
+               f'by {esc(rnd.deadline)}</text>' if rnd.deadline else ""))
+
+        for m in sorted(by_round.get(rnd.round_no, []), key=lambda x: x.slot):
+            top = centre(index, m.slot) - BOX_H / 2
+            boxes.append(_bracket_box(m, names, left, top, BOX_W, BOX_H,
+                                      viewer_id, division, match_format))
+            # Line from this box across to its parent's edge.
+            if index + 1 < len(rounds):
+                y = centre(index, m.slot)
+                parent_y = centre(index + 1, m.slot // 2)
+                mid = left + BOX_W + GAP_X / 2
+                lines.append(
+                    f'<path d="M{left + BOX_W} {y} H{mid} V{parent_y} '
+                    f'H{left + BOX_W + GAP_X}" fill="none" '
+                    f'stroke="var(--line)" stroke-width="1.5"/>')
+
+    return f"""<div class="scroll"><div style="position:relative;
+     width:{width}px;height:{height}px;min-width:{width}px">
+<svg width="{width}" height="{height}" style="position:absolute;inset:0"
+     aria-hidden="true">{''.join(lines)}{''.join(headers)}</svg>
+{''.join(boxes)}</div></div>"""
 
 
-def _bracket_cell(match, names: dict) -> str:
+def _bracket_box(match, names: dict, left: float, top: float, w: int, h: int,
+                 viewer_id, division: str, match_format: str) -> str:
     is_bye = match.status == "bye"
+    won = match.winner_id
 
-    def side(pid, is_winner):
+    def side(pid) -> str:
         if pid is None:
             return ('<span class="empty">bye</span>' if is_bye
                     else '<span class="empty">&mdash;</span>')
         name = esc(names.get(pid, "?"))
-        link = f'<a href="/player/{pid}">{name}</a>'
-        return f"<b>{link}</b>" if is_winner else link
+        cls = "bwin" if pid == won else ""
+        return f'<a class="{cls}" href="/player/{pid}">{name}</a>'
 
-    won = match.winner_id
-    tone = "var(--good)" if won else "var(--border)"
-    return (f'<div class="card" style="padding:8px 10px;margin:0 0 8px;'
-            f'border-left:3px solid {tone}">'
-            f'<div>{side(match.player_a, won == match.player_a)}</div>'
-            f'<div>{side(match.player_b, won == match.player_b)}</div></div>')
+    # Your own live match gets a direct way to arrange it, so you don't have to
+    # go and find the other player's profile.
+    action = ""
+    if (viewer_id and match.is_ready and viewer_id in match.players):
+        opponent = [p for p in match.players if p != viewer_id][0]
+        action = (f'<a class="bfind" href="/find/{opponent}?division='
+                  f'{esc(division)}&format={esc(match_format)}">Find a time</a>')
+
+    state = "done" if won else ("live" if match.is_ready else "waiting")
+    return (f'<div class="bbox {state}" style="left:{left}px;top:{top}px;'
+            f'width:{w}px;height:{h}px">'
+            f'<div class="brow">{side(match.player_a)}</div>'
+            f'<div class="brow">{side(match.player_b)}</div>{action}</div>')
 
 
 def standings_table(rows: Sequence, names: dict) -> str:

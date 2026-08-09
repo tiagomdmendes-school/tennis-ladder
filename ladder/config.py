@@ -117,7 +117,7 @@ class Config:
     # Coarse blocks are deliberate: nobody fills in a 15-minute grid.
     day_starts_at: int = 8 * 60          # 08:00, in minutes from midnight
     day_ends_at: int = 22 * 60           # 22:00
-    availability_slot_minutes: int = 60
+    availability_slot_minutes: int = 30
     # How far ahead the "block out a specific day" view runs.
     exception_horizon_days: int = 14
     # How many suggested times to offer when two players look for a match.

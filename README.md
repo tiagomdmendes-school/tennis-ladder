@@ -209,11 +209,15 @@ submission**.
 
 ## Finding matches outside practice
 
-**Availability.** Each player sets their *usual week* once on a grid — "Tuesdays
-3-6, Thursdays after 4" — which is what a class schedule actually gives you and
-doesn't go stale. Anything that differs is a one-tap exception on a real date:
+**Availability.** Each player sets their *usual week* once by dragging across a
+half-hour grid — "Tuesdays 3-6, Thursdays after 4" — which is what a class
+schedule actually gives you and doesn't go stale. Clicking a day name toggles
+the whole column. Anything that differs is a one-tap exception on a real date:
 the next fortnight is listed with a **Can't make it** button per day. The whole
 thing is designed around the fact that nobody maintains a detailed calendar.
+
+The grid is plain checkboxes underneath, so it still submits with JavaScript
+off; the drag-painting is an enhancement on top, not a requirement.
 
 **Requesting a match.** Open someone's profile, hit **Find a time**, and you get
 the windows you're both actually free, soonest first — filtered to gaps long
@@ -253,6 +257,7 @@ through — a scheduling mix-up shouldn't silently knock out your best player.
 | `/` | the ladders — points, rating ±RD, record, form, movement, season picker |
 | `/tournaments` | brackets and standings |
 | `/schedule` | requests waiting on you, agreed matches, what you've asked |
+| `/find` | pick any opponent from a dropdown and see your shared times |
 | `/availability` | your usual week, and blocking out specific days |
 | `/find/<id>` | times you and one opponent are both free |
 | `/submit` | submit a result (form adapts to the division) |
@@ -370,7 +375,7 @@ ladder/
   web.py / views.py  router, HTML, and the rating charts
   wsgi.py            entry point for gunicorn / PythonAnywhere
 tools/               seed_demo.py, ladderctl.py
-tests/               352 tests
+tests/               369 tests
 data/                ladder.db and config.json (created on first run)
 ```
 
@@ -390,7 +395,7 @@ Copy that one file and you have a complete backup.
 python3 -m unittest discover -s tests -t .
 ```
 
-352 tests, no dependencies. The ones worth knowing about:
+369 tests, no dependencies. The ones worth knowing about:
 
 - **`test_availability.py`** pins the interval arithmetic underneath the
   scheduler: merging, subtracting a blocked afternoon, intersecting two weeks,

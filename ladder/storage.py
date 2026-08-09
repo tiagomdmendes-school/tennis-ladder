@@ -920,6 +920,97 @@ class Database:
                 (match_id,)).fetchone()
         return _to_tmatch(row) if row else None
 
+    # ------------------------------------------------------- destructive ops
+    def delete_player_completely(self, player_id: int) -> dict:
+        """Erase a player and everything that referenced them.
+
+        Unlike deactivating, this cannot be undone and it removes matches that
+        other players also appeared in -- their opponents' records change too.
+        It exists for clearing out test data; for someone who has graduated,
+        deactivate instead so the history survives.
+        """
+        removed = {"matches": 0, "requests": 0, "tournament_entries": 0}
+        with self.connect() as conn:
+            removed["matches"] = conn.execute(
+                "SELECT COUNT(*) FROM matches WHERE player_a = ? OR player_a2 = ?"
+                " OR player_b = ? OR player_b2 = ?",
+                (player_id,) * 4).fetchone()[0]
+            removed["requests"] = conn.execute(
+                "SELECT COUNT(*) FROM match_requests WHERE from_player = ?"
+                " OR to_player = ?", (player_id, player_id)).fetchone()[0]
+            removed["tournament_entries"] = conn.execute(
+                "SELECT COUNT(*) FROM tournament_entries WHERE player_id = ?",
+                (player_id,)).fetchone()[0]
+
+            conn.execute("DELETE FROM matches WHERE player_a = ? OR player_a2 = ?"
+                         " OR player_b = ? OR player_b2 = ?", (player_id,) * 4)
+            conn.execute("DELETE FROM match_requests WHERE from_player = ?"
+                         " OR to_player = ?", (player_id, player_id))
+            conn.execute("DELETE FROM tournament_entries WHERE player_id = ?",
+                         (player_id,))
+            conn.execute("DELETE FROM tournament_matches WHERE player_a = ?"
+                         " OR player_b = ?", (player_id, player_id))
+            conn.execute("DELETE FROM availability WHERE player_id = ?", (player_id,))
+            conn.execute("DELETE FROM availability_exception WHERE player_id = ?",
+                         (player_id,))
+            conn.execute("DELETE FROM sessions WHERE player_id = ?", (player_id,))
+            conn.execute("UPDATE matches SET submitted_by = NULL WHERE submitted_by = ?",
+                         (player_id,))
+            conn.execute("UPDATE matches SET confirmed_by = NULL WHERE confirmed_by = ?",
+                         (player_id,))
+            conn.execute("DELETE FROM players WHERE id = ?", (player_id,))
+        self._touch()
+        return removed
+
+    def delete_season_completely(self, season_id: int) -> dict:
+        """Erase a season with its matches and tournaments."""
+        removed = {"matches": 0, "tournaments": 0}
+        with self.connect() as conn:
+            removed["matches"] = conn.execute(
+                "SELECT COUNT(*) FROM matches WHERE season_id = ?",
+                (season_id,)).fetchone()[0]
+            tournament_ids = [r[0] for r in conn.execute(
+                "SELECT id FROM tournaments WHERE season_id = ?", (season_id,))]
+            removed["tournaments"] = len(tournament_ids)
+
+            for tournament_id in tournament_ids:
+                conn.execute("DELETE FROM tournament_matches WHERE tournament_id = ?",
+                             (tournament_id,))
+                conn.execute("DELETE FROM tournament_entries WHERE tournament_id = ?",
+                             (tournament_id,))
+                conn.execute("DELETE FROM tournament_rounds WHERE tournament_id = ?",
+                             (tournament_id,))
+            conn.execute("DELETE FROM tournaments WHERE season_id = ?", (season_id,))
+            conn.execute("DELETE FROM matches WHERE season_id = ?", (season_id,))
+            conn.execute("DELETE FROM seasons WHERE id = ?", (season_id,))
+
+            # Never leave the club without a current season to record into.
+            still_current = conn.execute(
+                "SELECT COUNT(*) FROM seasons WHERE is_current = 1").fetchone()[0]
+            if not still_current:
+                latest = conn.execute(
+                    "SELECT id FROM seasons ORDER BY id DESC LIMIT 1").fetchone()
+                if latest:
+                    conn.execute("UPDATE seasons SET is_current = 1 WHERE id = ?",
+                                 (latest[0],))
+        self._touch()
+        return removed
+
+    def delete_tournament(self, tournament_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM tournament_matches WHERE tournament_id = ?",
+                         (tournament_id,))
+            conn.execute("DELETE FROM tournament_entries WHERE tournament_id = ?",
+                         (tournament_id,))
+            conn.execute("DELETE FROM tournament_rounds WHERE tournament_id = ?",
+                         (tournament_id,))
+            conn.execute("DELETE FROM tournaments WHERE id = ?", (tournament_id,))
+        self._touch()
+
+    def season_count(self) -> int:
+        with self.connect() as conn:
+            return conn.execute("SELECT COUNT(*) FROM seasons").fetchone()[0]
+
     # --------------------------------------------------------------- sessions
     def save_session(self, token: str, player_id: Optional[int],
                      is_admin: bool, csrf: str) -> None:
