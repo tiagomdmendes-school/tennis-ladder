@@ -79,9 +79,16 @@ def cmd_partners(service: LadderService, args) -> None:
 
 def cmd_add_player(service: LadderService, args) -> None:
     player = service.add_player(args.name, args.email or "", "", args.category)
-    pin = getattr(player, "generated_pin", "")
     print(f"Added {player.name} ({div.CATEGORY_LABELS[player.category]}). "
-          f"PIN: {pin}  -- pass it on now, it isn't stored in readable form.")
+          "They choose their own PIN the first time they sign in.")
+
+
+def cmd_clear_pin(service: LadderService, args) -> None:
+    player = service.db.find_player_by_name(args.name)
+    if not player:
+        raise SystemExit(f"No player called {args.name!r}.")
+    service.db.clear_pin(player.id)
+    print(f"Cleared {player.name}'s PIN. They'll pick a new one at next sign-in.")
 
 
 def cmd_record(service: LadderService, args) -> None:
@@ -166,6 +173,10 @@ def build_parser() -> argparse.ArgumentParser:
                    default=div.UNSPECIFIED)
     p.add_argument("--email")
     p.set_defaults(fn=cmd_add_player)
+
+    p = subs.add_parser("clear-pin", help="forget a player's PIN so they re-pick")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_clear_pin)
 
     p = subs.add_parser("record", help="record a result (score from side A's view)")
     p.add_argument("division", choices=list(div.DIVISION_ORDER))

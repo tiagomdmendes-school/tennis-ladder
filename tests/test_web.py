@@ -88,10 +88,15 @@ class WebTestCase(unittest.TestCase):
         return self.post("/login", {"csrf": self.csrf(), "as_admin": "1",
                                     "admin_password": "secret"})
 
-    def add(self, name, category=div.MENS, email=""):
-        """Returns (player, plain_pin) -- the PIN is only readable at creation."""
+    def add(self, name, category=div.MENS, email="", pin="1234"):
+        """Add a player with a PIN already set, for tests that just need to
+        sign in. Players normally arrive with no PIN and choose one on first
+        sign-in -- that flow is covered in TestClaimingAnAccount."""
         player = self.app.service.add_player(name, email, "", category)
-        return player, getattr(player, "generated_pin")
+        if pin:
+            self.db.set_pin(player.id, pin)
+            player = self.db.get_player(player.id)
+        return player, pin
 
     def roster(self):
         self.al, self.al_pin = self.add("Al")
@@ -314,6 +319,81 @@ class TestAuth(WebTestCase):
         self.assertEqual(self.db.list_matches(), [])
 
 
+class TestClaimingAnAccount(WebTestCase):
+    """Players choose their own PIN the first time they sign in.
+
+    A randomly generated 4-digit PIN is not something anyone remembers for a
+    credential they use twice a month, and it puts the captain in the business
+    of handing out secrets. This flow removes both problems.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Added the way admin adds them: no PIN at all.
+        self.newbie = self.app.service.add_player("Newbie", category=div.MENS)
+
+    def test_a_new_player_has_no_pin(self):
+        self.assertFalse(self.newbie.pin_set)
+        self.assertFalse(self.db.has_pin(self.newbie.id))
+
+    def test_signing_in_without_a_pin_offers_to_create_one(self):
+        _, body, url = self.post("/login", {
+            "csrf": self.csrf(), "player_id": self.newbie.id, "pin": ""})
+        self.assertIn("/claim", url)
+        self.assertIn("Choose a 4-digit PIN", body)
+        self.assertIn("Newbie", body)
+
+    def test_choosing_a_pin_sets_it_and_signs_them_in(self):
+        self.post("/login", {"csrf": self.csrf(), "player_id": self.newbie.id,
+                             "pin": ""})
+        _, body, _ = self.post("/claim", {
+            "csrf": self.csrf(), "player_id": self.newbie.id,
+            "pin": "2580", "pin2": "2580"})
+        self.assertTrue(self.flashes(body, "ok"))
+        self.assertTrue(self.db.check_pin(self.newbie.id, "2580"))
+        # And they're signed in already -- no second login step.
+        _, me, _ = self.get("/me")
+        self.assertIn("Newbie", me)
+
+    def test_mismatched_pins_are_rejected(self):
+        _, body, _ = self.post("/claim", {
+            "csrf": self.csrf(), "player_id": self.newbie.id,
+            "pin": "2580", "pin2": "1111"})
+        self.assertTrue(self.flashes(body, "err"))
+        self.assertFalse(self.db.has_pin(self.newbie.id))
+
+    def test_a_pin_that_is_not_four_digits_is_rejected(self):
+        for bad in ("12", "abcd", "123456"):
+            _, body, _ = self.post("/claim", {
+                "csrf": self.csrf(), "player_id": self.newbie.id,
+                "pin": bad, "pin2": bad})
+            self.assertTrue(self.flashes(body, "err"), bad)
+            self.assertFalse(self.db.has_pin(self.newbie.id), bad)
+
+    def test_an_account_that_already_has_a_pin_cannot_be_reclaimed(self):
+        taken, _ = self.add("Taken", pin="4321")
+        _, body, _ = self.post("/claim", {
+            "csrf": self.csrf(), "player_id": taken.id,
+            "pin": "0000", "pin2": "0000"})
+        self.assertTrue(self.flashes(body, "err"))
+        self.assertTrue(self.db.check_pin(taken.id, "4321"))
+
+    def test_after_an_admin_clears_it_they_choose_again(self):
+        self.db.set_pin(self.newbie.id, "1111")
+        self.db.clear_pin(self.newbie.id)
+        _, _, url = self.post("/login", {
+            "csrf": self.csrf(), "player_id": self.newbie.id, "pin": "1111"})
+        self.assertIn("/claim", url)
+        self.post("/claim", {"csrf": self.csrf(), "player_id": self.newbie.id,
+                             "pin": "9999", "pin2": "9999"})
+        self.assertTrue(self.db.check_pin(self.newbie.id, "9999"))
+        self.assertFalse(self.db.check_pin(self.newbie.id, "1111"))
+
+    def test_the_login_page_tells_first_timers_what_to_do(self):
+        _, body, _ = self.get("/login")
+        self.assertIn("First time?", body)
+
+
 class TestSettingsPage(WebTestCase):
     config_overrides = {"smtp_host": "smtp.example.edu",
                         "smtp_from": "ladder@example.edu",
@@ -368,24 +448,31 @@ class TestAdmin(WebTestCase):
         self.roster()
         self.login_admin()
 
-    def test_adding_a_player_reveals_their_pin_once(self):
+    def test_a_new_player_arrives_with_no_pin_to_hand_out(self):
         _, body, _ = self.post("/admin/player", {
             "csrf": self.csrf("/admin"), "action": "add",
             "name": "Cara Nunes", "category": div.WOMENS})
         player = self.db.find_player_by_name("Cara Nunes")
         self.assertIsNotNone(player)
         self.assertEqual(player.category, div.WOMENS)
-        shown = re.search(r"PIN is <b>(\d{4})</b>", body)
-        self.assertIsNotNone(shown)
-        self.assertTrue(self.db.check_pin(player.id, shown.group(1)))
+        self.assertFalse(player.pin_set)
+        self.assertFalse(self.db.has_pin(player.id))
+        # Nothing secret is shown, because nothing was generated.
+        self.assertNotRegex(body, r"PIN is <b>\d{4}</b>")
 
-    def test_resetting_a_pin_issues_a_new_working_one(self):
-        _, body, _ = self.post("/admin/player", {
-            "csrf": self.csrf("/admin"), "action": "resetpin",
-            "player_id": self.al.id})
-        shown = re.search(r"PIN is <b>(\d{4})</b>", body)
-        self.assertIsNotNone(shown)
-        self.assertTrue(self.db.check_pin(self.al.id, shown.group(1)))
+    def test_clearing_a_pin_sends_the_player_back_to_choosing_one(self):
+        self.assertTrue(self.db.has_pin(self.al.id))
+        self.post("/admin/player", {"csrf": self.csrf("/admin"),
+                                    "action": "clearpin",
+                                    "player_id": self.al.id})
+        self.assertFalse(self.db.has_pin(self.al.id))
+        self.assertFalse(self.db.check_pin(self.al.id, self.al_pin))
+
+    def test_the_players_table_shows_who_has_signed_in(self):
+        self.app.service.add_player("Never Signedin", category=div.MENS)
+        _, body, _ = self.get("/admin")
+        self.assertIn("not signed in yet", body)
+        self.assertIn("PIN set", body)
 
     def test_changing_a_category_takes_effect(self):
         self.post("/admin/player", {"csrf": self.csrf("/admin"),

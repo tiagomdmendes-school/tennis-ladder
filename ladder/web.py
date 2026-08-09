@@ -587,7 +587,9 @@ are unchanged &mdash; adjust them any time in
             players = app.db.list_players(active_only=True)
             pin_field = ("""<div><label for="pin">PIN</label>
 <input id="pin" name="pin" inputmode="numeric" maxlength="4" placeholder="4 digits">
-<div class="hint">Your 4-digit PIN, from the ladder admin.</div></div>"""
+<div class="hint"><b>First time?</b> Leave this blank &mdash; you'll be asked to
+choose a PIN. Forgotten yours? Ask the ladder admin to clear it and you can pick
+a new one.</div></div>"""
                          if app.config.require_pin else "")
             body = f"""<h1>Sign in</h1>
 <p class="sub">Signing in lets you submit and confirm results as yourself.
@@ -628,9 +630,71 @@ Browsing the ladders needs no account.</p>
             if player_id is None:
                 req.flash("err", "Pick your name.")
                 return redirect("/login")
+            # First time in? Send them to choose a PIN rather than rejecting
+            # them for not knowing one they were never given.
+            if app.config.require_pin and not app.db.has_pin(player_id):
+                return redirect(f"/claim?player_id={player_id}")
             player = app.service.authenticate(player_id, req.get("pin"))
             req.session["player_id"] = player.id
             req.flash("ok", f"Signed in as {esc(player.name)}.")
+            return redirect("/")
+
+        # ------------------------------------------------- claim an account
+        @self.route("GET", "/claim")
+        def claim_form(req: Request) -> Response:
+            player = app.db.get_player(req.get_int("player_id") or 0)
+            if not player:
+                req.flash("err", "Pick your name to get started.")
+                return redirect("/login")
+            if player.pin_set:
+                req.flash("ok", f"{esc(player.name)} already has a PIN. "
+                                "Sign in with it, or ask the ladder admin to "
+                                "reset it if you've forgotten.")
+                return redirect("/login")
+            body = f"""<h1>Welcome, {esc(player.name)}</h1>
+<p class="sub">You don't have a PIN yet. Pick one now &mdash; you'll use it to
+sign in and to confirm results. <b>Choose something you'll remember</b>; nobody
+else can look it up for you, but the ladder admin can clear it so you can set a
+new one.</p>
+<div class="card"><form class="stack" method="post" action="/claim">
+<input type="hidden" name="csrf" value="{esc(req.csrf)}">
+<input type="hidden" name="player_id" value="{player.id}">
+<div><label for="pin">Choose a 4-digit PIN</label>
+<input id="pin" name="pin" inputmode="numeric" maxlength="4" required
+       autocomplete="new-password"></div>
+<div><label for="pin2">Type it again</label>
+<input id="pin2" name="pin2" inputmode="numeric" maxlength="4" required
+       autocomplete="new-password"></div>
+<div class="row"><button type="submit">Set my PIN and sign in</button>
+<a class="btn ghost" href="/login">That's not me</a></div>
+</form></div>"""
+            return Response(app.render(req, "Choose a PIN", body))
+
+        @self.route("POST", "/claim")
+        def claim_post(req: Request) -> Response:
+            if not req.check_csrf():
+                req.flash("err", "Your session expired. Please try again.")
+                return redirect("/login")
+            player_id = req.get_int("player_id")
+            player = app.db.get_player(player_id or 0)
+            if not player:
+                return redirect("/login")
+            if player.pin_set:
+                req.flash("err", "That account already has a PIN.")
+                return redirect("/login")
+
+            pin, again = req.get("pin"), req.get("pin2")
+            if pin != again:
+                req.flash("err", "Those two PINs don't match. Try again.")
+                return redirect(f"/claim?player_id={player.id}")
+            try:
+                app.db.set_pin(player.id, pin)
+            except ValueError as exc:
+                req.flash("err", esc(str(exc)))
+                return redirect(f"/claim?player_id={player.id}")
+
+            req.session["player_id"] = player.id
+            req.flash("ok", f"PIN set. You're signed in as {esc(player.name)}.")
             return redirect("/")
 
         @self.route("GET", "/logout")
@@ -660,6 +724,8 @@ Browsing the ladders needs no account.</p>
     <input type="hidden" name="action" value="category">
     <noscript><button class="small ghost">Set</button></noscript>
   </form></td>
+  <td>{'<span class="pill">PIN set</span>' if p.pin_set
+       else '<span class="pill prov">not signed in yet</span>'}</td>
   <td>{'active' if p.active else '<span class="pill">inactive</span>'}</td>
   <td><div class="row" style="gap:4px">
     <form method="post" action="/admin/player" style="margin:0">
@@ -667,12 +733,13 @@ Browsing the ladders needs no account.</p>
       <input type="hidden" name="player_id" value="{p.id}">
       <button class="small ghost" name="action" value="toggle">
         {'Deactivate' if p.active else 'Reactivate'}</button></form>
-    <form method="post" action="/admin/player" style="margin:0">
-      <input type="hidden" name="csrf" value="{esc(req.csrf)}">
-      <input type="hidden" name="player_id" value="{p.id}">
-      <button class="small ghost" name="action" value="resetpin">Reset PIN</button>
-    </form></div></td></tr>""" for p in players) or \
-                '<tr><td colspan="4" class="empty">No players yet.</td></tr>'
+    {'''<form method="post" action="/admin/player" style="margin:0">
+      <input type="hidden" name="csrf" value="''' + esc(req.csrf) + '''">
+      <input type="hidden" name="player_id" value="''' + str(p.id) + '''">
+      <button class="small ghost" name="action" value="clearpin">Clear PIN</button>
+    </form>''' if p.pin_set else ''}
+  </div></td></tr>""" for p in players) or \
+                '<tr><td colspan="5" class="empty">No players yet.</td></tr>'
 
             names = {p.id: p.name for p in players}
             pending = app.db.list_matches(status=PENDING)
@@ -700,6 +767,8 @@ recalculates every rating that came after it.</p>
     <div class="hint">Decides which ladders they can enter.</div></div>
   <div><label for="email">Email (optional)</label>
     <input id="email" name="email" type="email"></div>
+  <div class="hint">No PIN needed &mdash; they choose their own when they first
+  sign in.</div>
   <div class="row"><button name="action" value="add">Add player</button></div>
 </form></div>
 
@@ -734,8 +803,11 @@ recalculates every rating that came after it.</p>
 </form></div>
 
 <h2>Players</h2>
+<p class="sub">Players choose their own PIN the first time they sign in, so
+there's nothing to hand out. If someone forgets theirs, clear it here and they
+pick a new one.</p>
 <div class="card scroll"><table><thead><tr><th>Name</th><th>Category</th>
-<th>Status</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
+<th>PIN</th><th>Status</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>
 
 <h2>Unconfirmed ({len(pending)})</h2>
 <div class="card">{match_rows(pending, names, actions='admin', csrf=req.csrf)}</div>
@@ -754,10 +826,9 @@ recalculates every rating that came after it.</p>
                 player = app.service.add_player(
                     req.get("name"), req.get("email"), "", req.get("category")
                     or div.UNSPECIFIED)
-                pin = getattr(player, "generated_pin", "")
-                req.flash("ok", f"Added {esc(player.name)}. Their PIN is "
-                                f"<b>{esc(pin)}</b> &mdash; pass it on now, it "
-                                "isn't stored in readable form.")
+                req.flash("ok", f"Added {esc(player.name)}. Nothing to hand "
+                                "over &mdash; they pick their own PIN the first "
+                                "time they sign in.")
                 return redirect("/admin")
 
             pid = req.get_int("player_id")
@@ -776,10 +847,10 @@ recalculates every rating that came after it.</p>
                     app.service.engine.invalidate()
                     req.flash("ok", f"{esc(player.name)} is now "
                                     f"{esc(div.CATEGORY_LABELS[category])}.")
-            elif action == "resetpin":
-                pin = app.db.reset_pin(player.id)
-                req.flash("ok", f"{esc(player.name)}'s new PIN is "
-                                f"<b>{esc(pin)}</b> &mdash; pass it on now.")
+            elif action == "clearpin":
+                app.db.clear_pin(player.id)
+                req.flash("ok", f"Cleared {esc(player.name)}'s PIN. They'll "
+                                "choose a new one next time they sign in.")
             return redirect("/admin")
 
         @self.route("POST", "/admin/season")

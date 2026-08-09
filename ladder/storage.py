@@ -10,7 +10,6 @@ immediately, with no drift and no migration.
 from __future__ import annotations
 
 import os
-import random
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -38,6 +37,8 @@ class Player:
     category: str
     active: bool
     joined_on: str
+    # False until they've signed in once and chosen a PIN.
+    pin_set: bool = False
     notify_confirm: bool = True
     notify_result: bool = True
     notify_weekly: bool = False
@@ -275,13 +276,20 @@ class Database:
         self, name: str, email: str = "", pin: str = "",
         category: str = UNSPECIFIED,
     ) -> Player:
+        """Add a player. With no `pin`, they choose their own on first sign-in.
+
+        That default matters: a randomly generated 4-digit PIN is something
+        nobody remembers for a credential they use twice a month, and it puts
+        the admin in the business of distributing secrets. Letting people pick
+        their own removes both problems.
+        """
         name = name.strip()
         if not name:
             raise ValueError("A player needs a name.")
         if self.find_player_by_name(name):
             raise ValueError(f"{name} is already on the ladder.")
-        pin = pin.strip() or f"{random.randint(0, 9999):04d}"
-        pin_hash, salt = hash_pin(pin)
+        pin = pin.strip()
+        pin_hash, salt = hash_pin(pin) if pin else ("", "")
         with self.connect() as conn:
             cur = conn.execute(
                 "INSERT INTO players (name, email, pin_hash, pin_salt, category,"
@@ -291,11 +299,15 @@ class Database:
             )
             player_id = cur.lastrowid
         self._touch()
-        player = self.get_player(player_id)
-        # The caller needs the plain PIN once, to hand to the player; it is not
-        # recoverable afterwards.
-        player.generated_pin = pin                 # type: ignore[attr-defined]
-        return player                              # type: ignore[return-value]
+        return self.get_player(player_id)          # type: ignore[return-value]
+
+    def has_pin(self, player_id: int) -> bool:
+        """Whether this player has claimed their account yet."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT pin_hash FROM players WHERE id = ?", (player_id,)
+            ).fetchone()
+        return bool(row and row["pin_hash"])
 
     def get_player(self, player_id: int) -> Optional[Player]:
         with self.connect() as conn:
@@ -374,11 +386,18 @@ class Database:
                          (pin_hash, salt, player_id))
         self._touch()
 
-    def reset_pin(self, player_id: int) -> str:
-        """Generate a new PIN and return it once, in plain text."""
-        pin = f"{random.randint(0, 9999):04d}"
-        self.set_pin(player_id, pin)
-        return pin
+    def clear_pin(self, player_id: int) -> None:
+        """Forget a player's PIN so they choose a new one next time they sign in.
+
+        This is the whole 'I forgot my PIN' path: the admin never learns or
+        hands over a secret, and the player picks something memorable again.
+        """
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE players SET pin_hash = '', pin_salt = '' WHERE id = ?",
+                (player_id,),
+            )
+        self._touch()
 
     def check_pin(self, player_id: int, pin: str) -> bool:
         with self.connect() as conn:
@@ -572,7 +591,7 @@ def _to_player(row: sqlite3.Row) -> Player:
     return Player(
         id=row["id"], name=row["name"], email=row["email"],
         category=row["category"], active=bool(row["active"]),
-        joined_on=row["joined_on"],
+        joined_on=row["joined_on"], pin_set=bool(row["pin_hash"]),
         notify_confirm=bool(row["notify_confirm"]),
         notify_result=bool(row["notify_result"]),
         notify_weekly=bool(row["notify_weekly"]),

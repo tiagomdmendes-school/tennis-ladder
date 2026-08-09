@@ -232,8 +232,11 @@ python3 run.py          # writes data/config.json on first run
 Edit `data/config.json` and restart. **Set `admin_password` — it starts as
 `changeme`** and the server warns you on every boot.
 
-Then, as admin: add each player with their category (each gets a 4-digit PIN,
-shown once), import any past results, and share the URL.
+Then, as admin: add each player with their category, import any past results,
+and share the URL. **There are no PINs to hand out** — each player picks their
+own the first time they sign in, so it's something they'll actually remember. If
+someone forgets theirs, clear it from `/admin` and they choose again; nobody,
+including you, can read an existing PIN.
 
 ### Settings worth knowing
 
@@ -367,7 +370,10 @@ python3 -m unittest discover -s tests -t .
 - **One process.** Sessions persist in SQLite, but the rating cache is
   in-memory. Run a single worker — it's ample for a club.
 - **PINs gate identity, not value.** They answer "did the right person confirm
-  this result". Hashed, but don't reuse a PIN that matters.
+  this result", and are stored hashed so nobody can read them back. Players
+  choose their own on first sign-in; anyone who reaches the site before a
+  teammate does could claim that name, which is a deliberate trade for not
+  making the captain distribute secrets. An admin can clear a PIN to undo it.
 - **Categories are a two-way split** (men's / women's / unspecified) because the
   divisions the club competes in are structured that way. `unspecified` players
   can be added and rated but must be categorised before entering a gendered
