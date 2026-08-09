@@ -1,0 +1,17 @@
+# The club's actual data: the SQLite database (player emails, hashed PINs,
+# every match) and config.json (which holds the admin password). This must
+# never be committed -- it is the one directory that is not code.
+data/
+*.db
+*.db-journal
+*.db-wal
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Machine-local editor/tool settings, not part of the app.
+.claude/settings.local.json
+
+.DS_Store
