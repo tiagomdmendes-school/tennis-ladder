@@ -12,6 +12,7 @@ Nothing to install: standard library only, Python 3.10+.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 
@@ -29,11 +30,15 @@ def main() -> int:
                         help="seed a demo club first (only if the database is empty)")
     args = parser.parse_args()
 
-    # The data directory has to be settled before anything imports CONFIG.
+    # The data directory has to be settled before anything imports the config,
+    # because importing it loads (and creates) config.json immediately. Setting
+    # the environment variable first means the very first import already points
+    # at the right place. Importing the module and *then* redirecting it would
+    # leave a stray config.json behind in the project directory -- which is
+    # worse than untidy: it's a second file that looks like the real one, so
+    # editing the wrong copy silently does nothing.
     if args.data_dir:
-        from ladder import config as config_module
-        config_module.set_data_dir(args.data_dir)
-        config_module.CONFIG = config_module.Config.load()
+        os.environ["LADDER_DATA_DIR"] = os.path.abspath(args.data_dir)
 
     from ladder.config import CONFIG, DB_PATH
     from ladder.web import serve
