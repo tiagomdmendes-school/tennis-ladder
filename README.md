@@ -207,11 +207,54 @@ submission**.
 
 ---
 
+## Finding matches outside practice
+
+**Availability.** Each player sets their *usual week* once on a grid — "Tuesdays
+3-6, Thursdays after 4" — which is what a class schedule actually gives you and
+doesn't go stale. Anything that differs is a one-tap exception on a real date:
+the next fortnight is listed with a **Can't make it** button per day. The whole
+thing is designed around the fact that nobody maintains a detailed calendar.
+
+**Requesting a match.** Open someone's profile, hit **Find a time**, and you get
+the windows you're both actually free, soonest first — filtered to gaps long
+enough for the format you picked. A 60-minute Thursday overlap is offered for a
+single set but not for best-of-three. One click sends a request; nothing is
+booked until they accept. Accepting cancels your other pending asks with that
+player, so you don't end up double-booked.
+
+Match length comes from `match_formats` in the config, so if your sets run long,
+change the minutes and every suggestion updates.
+
+## Tournaments
+
+An admin creates one from `/admin`: pick a division, a format, and who's in.
+
+- **Single elimination** — a seeded bracket. Seeds come from current ladder
+  position, or a random draw if the ladder is too young to mean much. Byes go to
+  the top seeds automatically when the field isn't a power of two, and the top
+  two seeds can only meet in the final.
+- **Round robin** — everyone plays everyone, with a standings table ranked on
+  wins, then head-to-head, then games difference. Better for a small club: one
+  bad afternoon doesn't end your tournament.
+
+Each round gets a **play-by date**; players arrange actual times between
+themselves using the same availability matching. Results go in the normal way —
+submit a score and the draw advances itself. **Tournament matches count towards
+ladder ratings** like any other match.
+
+When a deadline passes with a match unplayed, nothing happens automatically. The
+tournament page flags it to the admin, who can extend the round or send someone
+through — a scheduling mix-up shouldn't silently knock out your best player.
+
 ## Pages
 
 | | |
 |---|---|
 | `/` | the ladders — points, rating ±RD, record, form, movement, season picker |
+| `/tournaments` | brackets and standings |
+| `/schedule` | requests waiting on you, agreed matches, what you've asked |
+| `/availability` | your usual week, and blocking out specific days |
+| `/find/<id>` | times you and one opponent are both free |
 | `/submit` | submit a result (form adapts to the division) |
 | `/pending` | confirm or dispute |
 | `/matches` | full history, filterable by division |
@@ -310,20 +353,24 @@ database, so a restart doesn't sign the club out.
 
 ```
 run.py               start the server
+deploy.sh            pull + restart, on the server
 ladder/
   glicko2.py         the rating maths — pure functions, no I/O
   doubles.py         the virtual-opponent reduction for team play
   divisions.py       the five ladders and who may enter each
+  availability.py    interval maths: who's free, and when two people overlap
+  tournaments.py     seeded brackets, round-robin rotation, standings
   scoring.py         tennis scores in, [0,1] rating scores out
-  storage.py         SQLite: players, seasons, matches, sessions
+  storage.py         SQLite: players, seasons, matches, availability, draws
   migrations.py      schema versioning and PIN hashing
   engine.py          replays match history into every ladder
-  service.py         the rules (who may confirm what, CSV import)
+  scheduling.py      suggested times and match requests
+  service.py         the rules (who may confirm what, running a tournament)
   mailer.py          opt-in notifications, on a background queue
   web.py / views.py  router, HTML, and the rating charts
   wsgi.py            entry point for gunicorn / PythonAnywhere
 tools/               seed_demo.py, ladderctl.py
-tests/               220 tests
+tests/               352 tests
 data/                ladder.db and config.json (created on first run)
 ```
 
@@ -343,7 +390,14 @@ Copy that one file and you have a complete backup.
 python3 -m unittest discover -s tests -t .
 ```
 
-220 tests, no dependencies. The ones worth knowing about:
+352 tests, no dependencies. The ones worth knowing about:
+
+- **`test_availability.py`** pins the interval arithmetic underneath the
+  scheduler: merging, subtracting a blocked afternoon, intersecting two weeks,
+  and refusing to suggest a gap too short for the format.
+- **`test_tournaments.py`** checks the draw is a real bracket — top two seeds in
+  opposite halves, byes to the top seeds — and that a three-way cycle in a round
+  robin is left unresolved rather than given a fake order.
 
 - **`test_glicko2.py`** checks the implementation against the worked example in
   Glickman's own paper (1464.06 / RD 151.52). If this fails, everything built on

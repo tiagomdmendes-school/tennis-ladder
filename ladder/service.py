@@ -9,13 +9,15 @@ from __future__ import annotations
 import csv
 import io
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Callable, List, Optional, Sequence, Tuple
 
 from . import divisions as div
+from . import tournaments
 from .config import Config
 from .divisions import DivisionError
 from .engine import LadderEngine
+from .scheduling import Scheduler
 from .scoring import ScoreError, parse_score
 from .storage import (
     CONFIRMED, PENDING, REJECTED, SIDE_A, SIDE_B, Database, Match, Player,
@@ -38,6 +40,7 @@ class LadderService:
         self.db = db
         self.config = config
         self.engine = LadderEngine(db, config)
+        self.scheduler = Scheduler(db, config)
         # Called as notifier(event, **context). Injected so the service never
         # depends on email being configured, or working.
         self.notifier = notifier
@@ -129,7 +132,19 @@ class LadderService:
 
         if status == PENDING:
             self._notify("confirm_needed", match=self.db.get_match(match_id))
+        else:
+            # A result entered as already-confirmed (admin, or an import) never
+            # passes through confirm(), so the tournament draw has to be moved
+            # on from here as well.
+            self._settle_confirmed(self.db.get_match(match_id))
         return Submission(match_id=match_id, status=status, warning=warning)
+
+    def _settle_confirmed(self, match: Optional[Match]) -> None:
+        """Everything that follows a result counting: draws and schedules."""
+        if not match:
+            return
+        self._advance_tournaments(match)
+        self.scheduler.close_played(match.players, match.division)
 
     def confirm(self, match_id: int, actor_id: Optional[int], *,
                 is_admin: bool = False) -> Match:
@@ -151,6 +166,7 @@ class LadderService:
         self.db.set_match_status(match_id, CONFIRMED, actor_id=actor_id)
         self.engine.invalidate()
         confirmed = self.db.get_match(match_id)
+        self._settle_confirmed(confirmed)
         self._notify("result_confirmed", match=confirmed, actor_id=actor_id)
         return confirmed                            # type: ignore[return-value]
 
@@ -187,6 +203,195 @@ class LadderService:
             m for m in self.db.list_matches(status=PENDING)
             if player_id in m.players and player_id in self._submitters_side(m)
         ]
+
+    # ------------------------------------------------------------ tournaments
+    def create_tournament(
+        self, *, name: str, division: str, style: str, seeding: str,
+        match_format: str, player_ids: Sequence[int],
+        round_days: int = 7, start_on: Optional[str] = None,
+    ):
+        """Set up a tournament and generate its draw.
+
+        Entrants are seeded by their current ladder position unless a random
+        draw was asked for. Each round gets a play-by date; players arrange the
+        actual times between themselves.
+        """
+        if style not in tournaments.STYLES:
+            raise ServiceError(f"{style!r} isn't a tournament format.")
+        if seeding not in tournaments.SEEDINGS:
+            raise ServiceError(f"{seeding!r} isn't a seeding method.")
+        if not div.is_division(division):
+            raise ServiceError(f"{division!r} is not one of the club's divisions.")
+        if div.get(division).is_doubles:
+            raise ServiceError(
+                "Tournaments run in the singles divisions for now.")
+        if match_format not in self.config.match_formats:
+            raise ServiceError(f"{match_format!r} isn't a known match format.")
+
+        entrants = [int(p) for p in player_ids]
+        if len(set(entrants)) != len(entrants):
+            raise ServiceError("The same player is entered twice.")
+        if len(entrants) < 2:
+            raise ServiceError("A tournament needs at least two players.")
+        for player_id in entrants:
+            if not self.db.get_player(player_id):
+                raise ServiceError("One of those players isn't on the ladder.")
+
+        ordered = self._seed_order(entrants, division, seeding)
+        season = self.db.current_season()
+        tournament_id = self.db.create_tournament(
+            name=name, division=division, season_id=season.id, style=style,
+            seeding=seeding, match_format=match_format)
+        self.db.set_entries(tournament_id, ordered)
+        self._generate_draw(tournament_id, ordered, style, round_days, start_on)
+        self.db.set_tournament_status(tournament_id, "running")
+        return self.db.get_tournament(tournament_id)
+
+    def _seed_order(self, entrants: Sequence[int], division: str,
+                    seeding: str) -> List[int]:
+        if seeding == tournaments.RANDOM_SEEDING:
+            return tournaments.order_entrants(entrants, seeding)
+        ladder = self.engine.ladder(division, include_inactive=True)
+        # Ladder order first; anyone with no rating yet goes to the bottom,
+        # since seeding them above proven players would be guesswork.
+        ranked = sorted(
+            entrants,
+            key=lambda pid: (ladder.rank_of(pid) or 10_000,
+                             (self.db.get_player(pid).name or "").lower()),
+        )
+        return ranked
+
+    def _generate_draw(self, tournament_id: int, ordered: Sequence[int],
+                       style: str, round_days: int,
+                       start_on: Optional[str]) -> None:
+        if style == tournaments.ELIMINATION:
+            draw = tournaments.build_elimination(ordered)
+        else:
+            draw = tournaments.build_round_robin(ordered)
+
+        rows = []
+        for pairings in draw.rounds:
+            for p in pairings:
+                status = "bye" if p.is_bye else (
+                    "ready" if p.player_a and p.player_b else "pending")
+                rows.append((p.round_no, p.slot, p.player_a, p.player_b, status))
+        self.db.replace_tournament_matches(tournament_id, rows)
+
+        start = self._parse_date(start_on) if start_on else date.today()
+        self.db.set_rounds(tournament_id, [
+            (index, name,
+             (start + timedelta(days=round_days * (index + 1))).isoformat())
+            for index, name in enumerate(draw.round_names)
+        ])
+
+        if style == tournaments.ELIMINATION:
+            self._settle_byes(tournament_id)
+        self.engine.invalidate()
+
+    def _settle_byes(self, tournament_id: int) -> None:
+        """Walk bye recipients into the next round straight away."""
+        for tmatch in self.db.tournament_matches(tournament_id, round_no=0):
+            if tmatch.status != "bye":
+                continue
+            occupant = tmatch.player_a if tmatch.player_a else tmatch.player_b
+            if occupant is None:
+                continue
+            self.db.update_tournament_match(tmatch.id, winner_id=occupant)
+            self._promote(tournament_id, tmatch.round_no, tmatch.slot, occupant)
+
+    def _promote(self, tournament_id: int, round_no: int, slot: int,
+                 winner_id: int) -> None:
+        """Put a winner into their next-round slot."""
+        next_round, next_slot, side = tournaments.parent_slot(round_no, slot)
+        for candidate in self.db.tournament_matches(tournament_id, round_no=next_round):
+            if candidate.slot != next_slot:
+                continue
+            if side == "a":
+                self.db.update_tournament_match(candidate.id, player_a=winner_id)
+            else:
+                self.db.update_tournament_match(candidate.id, player_b=winner_id)
+            refreshed = self.db.get_tournament_match(candidate.id)
+            if refreshed and refreshed.is_ready:
+                self.db.update_tournament_match(candidate.id, status="ready")
+            return
+
+    def _advance_tournaments(self, match: Match) -> None:
+        """Link a confirmed result to a tournament match and move the draw on.
+
+        Matched by players and division rather than asking anyone to tag the
+        result: people submit a score, they shouldn't have to remember it was
+        also round two of something.
+        """
+        if match.is_doubles:
+            return
+        players = set(match.players)
+        for tournament in self.db.list_tournaments():
+            if tournament.division != match.division or tournament.status != "running":
+                continue
+            for tmatch in self.db.tournament_matches(tournament.id):
+                if tmatch.winner_id is not None or set(tmatch.players) != players:
+                    continue
+                self.db.update_tournament_match(
+                    tmatch.id, winner_id=match.winner_id, match_id=match.id,
+                    status="played")
+                if tournament.style == tournaments.ELIMINATION:
+                    self._promote(tournament.id, tmatch.round_no, tmatch.slot,
+                                  match.winner_id)
+                self._check_complete(tournament.id)
+                return
+
+    def _check_complete(self, tournament_id: int) -> None:
+        outstanding = [t for t in self.db.tournament_matches(tournament_id)
+                       if t.winner_id is None]
+        if not outstanding:
+            self.db.set_tournament_status(tournament_id, "complete")
+
+    def tournament_standings(self, tournament_id: int):
+        """Round-robin table, ordered."""
+        entrants = [pid for pid, _ in self.db.entries(tournament_id)]
+        results = []
+        for tmatch in self.db.tournament_matches(tournament_id):
+            if tmatch.winner_id is None or tmatch.match_id is None:
+                continue
+            match = self.db.get_match(tmatch.match_id)
+            if not match:
+                continue
+            won, lost = match.games_for(tmatch.winner_id)
+            results.append({"winner": tmatch.winner_id, "loser": tmatch.loser(),
+                            "winner_games": won, "loser_games": lost})
+        return tournaments.standings(entrants, results)
+
+    def overdue_matches(self, tournament_id: int) -> List:
+        """Matches whose round deadline has passed and still aren't played."""
+        deadlines = {r.round_no: r for r in self.db.rounds(tournament_id)}
+        out = []
+        for tmatch in self.db.tournament_matches(tournament_id):
+            round_info = deadlines.get(tmatch.round_no)
+            if (tmatch.winner_id is None and tmatch.is_ready
+                    and round_info and round_info.is_overdue):
+                out.append(tmatch)
+        return out
+
+    def force_tournament_winner(self, tmatch_id: int, winner_id: int) -> None:
+        """Admin decision for a match that never got played."""
+        tmatch = self.db.get_tournament_match(tmatch_id)
+        if not tmatch:
+            raise ServiceError("That tournament match no longer exists.")
+        if winner_id not in tmatch.players:
+            raise ServiceError("That player isn't in this match.")
+        tournament = self.db.get_tournament(tmatch.tournament_id)
+        self.db.update_tournament_match(tmatch_id, winner_id=winner_id,
+                                        status="played")
+        if tournament and tournament.style == tournaments.ELIMINATION:
+            self._promote(tournament.id, tmatch.round_no, tmatch.slot, winner_id)
+        self._check_complete(tmatch.tournament_id)
+
+    @staticmethod
+    def _parse_date(value: str) -> date:
+        try:
+            return datetime.strptime(value, "%Y-%m-%d").date()
+        except ValueError:
+            raise ServiceError(f"{value!r} isn't a date. Use YYYY-MM-DD.") from None
 
     # --------------------------------------------------------------- seasons
     def start_season(self, name: str, starts_on: Optional[str] = None):

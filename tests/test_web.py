@@ -10,6 +10,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import date, datetime, timedelta
 from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
@@ -518,6 +519,184 @@ class TestAdmin(WebTestCase):
                                     "action": "toggle", "player_id": self.al.id})
         self.assertFalse(self.db.get_player(self.al.id).active)
         self.assertIsNone(self.app.service.engine.ladder(MS).entry(self.al.id))
+
+
+class TestAvailabilityPages(WebTestCase):
+    def setUp(self):
+        super().setUp()
+        self.roster()
+        self.login_as(self.al, self.al_pin)
+
+    def test_saving_the_grid_stores_a_merged_week(self):
+        payload = [("csrf", self.csrf("/availability")),
+                   ("slot", "1-900-960"), ("slot", "1-960-1020"),
+                   ("slot", "3-540-600")]
+        body = urllib.parse.urlencode(payload).encode()
+        self.opener.open(urllib.request.Request(
+            self.base + "/availability", data=body))
+        weekly = self.db.get_availability(self.al.id).weekly
+        self.assertEqual(weekly[1], [(900, 1020)])      # contiguous merged
+        self.assertEqual(weekly[3], [(540, 600)])
+
+    def test_saving_an_empty_grid_clears_the_week(self):
+        self.db.set_weekly_availability(self.al.id, {1: [(900, 1020)]})
+        self.post("/availability", {"csrf": self.csrf("/availability")})
+        self.assertEqual(self.db.get_availability(self.al.id).weekly, {})
+
+    def test_blocking_a_day_leaves_the_pattern_alone(self):
+        self.db.set_weekly_availability(self.al.id, {d: [(900, 1080)]
+                                                    for d in range(7)})
+        target = (date.today() + timedelta(days=2)).isoformat()
+        self.post("/availability/day", {"csrf": self.csrf("/availability"),
+                                        "on_date": target, "action": "block"})
+        avail = self.db.get_availability(self.al.id)
+        self.assertEqual(avail.on(date.fromisoformat(target)), [])
+        self.assertEqual(avail.weekly[0], [(900, 1080)])     # pattern intact
+
+    def test_undoing_a_block_restores_the_day(self):
+        self.db.set_weekly_availability(self.al.id, {d: [(900, 1080)]
+                                                    for d in range(7)})
+        target = (date.today() + timedelta(days=2)).isoformat()
+        csrf = self.csrf("/availability")
+        self.post("/availability/day", {"csrf": csrf, "on_date": target,
+                                        "action": "block"})
+        self.post("/availability/day", {"csrf": csrf, "on_date": target,
+                                        "action": "restore"})
+        self.assertEqual(
+            self.db.get_availability(self.al.id).on(date.fromisoformat(target)),
+            [(900, 1080)])
+
+    def test_anonymous_visitors_are_sent_to_sign_in(self):
+        self.get("/logout")
+        _, _, url = self.get("/availability")
+        self.assertIn("/login", url)
+
+
+class TestSchedulingPages(WebTestCase):
+    def setUp(self):
+        super().setUp()
+        self.roster()
+        # Al and Bo overlap on the same weekday.
+        for pid in (self.al.id, self.bo.id):
+            self.db.set_weekly_availability(pid, {d: [(900, 1200)]
+                                                  for d in range(7)})
+        self.login_as(self.al, self.al_pin)
+
+    def test_the_find_page_offers_real_overlapping_times(self):
+        _, body, _ = self.get(f"/find/{self.bo.id}")
+        self.assertIn("Suggested times", body)
+        self.assertIn('name="starts_at"', body)
+        self.assertNotIn("No overlap", body)
+
+    def test_it_says_so_when_nobody_has_set_availability(self):
+        _, body, _ = self.get(f"/find/{self.cy.id}")
+        self.assertIn("availability", body)
+        self.assertIn("No overlap", body)
+
+    def test_sending_and_accepting_a_request(self):
+        when = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%dT16:00")
+        _, body, _ = self.post("/request", {
+            "csrf": self.csrf("/schedule"), "opponent": self.bo.id,
+            "division": MS, "match_format": "one_set", "starts_at": when,
+            "message": "courts free"})
+        self.assertTrue(self.flashes(body, "ok"))
+        request = self.db.list_match_requests(player_id=self.al.id)[0]
+        self.assertEqual(request.status, "pending")
+
+        self.get("/logout")
+        self.login_as(self.bo, self.bo_pin)
+        _, body, _ = self.post("/request/respond", {
+            "csrf": self.csrf("/schedule"), "request_id": request.id,
+            "action": "accept"})
+        self.assertTrue(self.flashes(body, "ok"))
+        self.assertEqual(self.db.get_match_request(request.id).status, "accepted")
+
+    def test_a_request_in_the_past_is_refused(self):
+        when = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%dT16:00")
+        _, body, _ = self.post("/request", {
+            "csrf": self.csrf("/schedule"), "opponent": self.bo.id,
+            "division": MS, "match_format": "one_set", "starts_at": when})
+        self.assertTrue(self.flashes(body, "err"))
+        self.assertEqual(self.db.list_match_requests(), [])
+
+    def test_the_schedule_page_nudges_you_to_set_availability(self):
+        self.get("/logout")
+        self.login_as(self.cy, self.cy_pin)          # Cy has none
+        _, body, _ = self.get("/schedule")
+        self.assertIn("set your availability", body)
+        self.assertIn('href="/availability"', body)
+
+
+class TestTournamentPages(WebTestCase):
+    def setUp(self):
+        super().setUp()
+        self.roster()
+        for day in (30, 25, 20):
+            self.app.service.submit_result(
+                division=MS, side_a=[self.al.id], side_b=[self.bo.id],
+                score_text="6-2", played_on=days_ago(day), auto_confirm=True)
+
+    def create(self, style="elimination"):
+        self.login_admin()
+        payload = [("csrf", self.csrf("/admin")), ("action", "create"),
+                   ("name", "Fall Open"), ("division", MS), ("style", style),
+                   ("seeding", "ladder"), ("match_format", "one_set"),
+                   ("round_days", "7")]
+        payload += [("entrant", str(p.id))
+                    for p in (self.al, self.bo, self.cy, self.dan)]
+        body = urllib.parse.urlencode(payload).encode()
+        return self.opener.open(urllib.request.Request(
+            self.base + "/admin/tournament", data=body)).read().decode()
+
+    def test_an_admin_can_create_a_tournament(self):
+        self.create()
+        events = self.db.list_tournaments()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].name, "Fall Open")
+        self.assertEqual(len(self.db.entries(events[0].id)), 4)
+
+    def test_the_bracket_renders(self):
+        self.create()
+        tournament = self.db.list_tournaments()[0]
+        status, body, _ = self.get(f"/tournament/{tournament.id}")
+        self.assertEqual(status, 200)
+        self.assertIn("Draw", body)
+        self.assertIn("Semi-finals", body)
+
+    def test_a_round_robin_shows_standings_instead(self):
+        self.create(style="round_robin")
+        tournament = self.db.list_tournaments()[0]
+        _, body, _ = self.get(f"/tournament/{tournament.id}")
+        self.assertIn("Standings", body)
+        self.assertNotIn("<h2>Draw</h2>", body)
+
+    def test_the_tournament_list_shows_it(self):
+        self.create()
+        _, body, _ = self.get("/tournaments")
+        self.assertIn("Fall Open", body)
+
+    def test_a_non_admin_cannot_create_one(self):
+        self.login_as(self.al, self.al_pin)
+        payload = [("csrf", self.csrf("/schedule")), ("action", "create"),
+                   ("name", "Sneaky Cup"), ("division", MS),
+                   ("style", "elimination"), ("seeding", "ladder"),
+                   ("match_format", "one_set")]
+        payload += [("entrant", str(self.al.id)), ("entrant", str(self.bo.id))]
+        self.opener.open(urllib.request.Request(
+            self.base + "/admin/tournament",
+            data=urllib.parse.urlencode(payload).encode()))
+        self.assertEqual(self.db.list_tournaments(), [])
+
+    def test_overdue_matches_are_flagged_to_the_admin(self):
+        self.create()
+        tournament = self.db.list_tournaments()[0]
+        self.db.set_round_deadline(tournament.id, 0, days_ago(3))
+        _, body, _ = self.get(f"/tournament/{tournament.id}")
+        self.assertIn("past the round", body)
+        self.assertIn("advances", body)
+
+    def test_unknown_tournaments_are_404(self):
+        self.assertEqual(self.get("/tournament/999")[0], 404)
 
 
 class TestPlayerPage(WebTestCase):

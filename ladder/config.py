@@ -11,7 +11,7 @@ import json
 import os
 import secrets
 from dataclasses import asdict, dataclass, field, fields
-from typing import List
+from typing import Dict, List
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -97,6 +97,31 @@ class Config:
     # different doubles player corrects it within a few matches.
     cross_division_seed: bool = True
     cross_division_rd: float = 300.0
+
+    # --- match formats -------------------------------------------------
+    # How long each format takes on court, used to find gaps in two players'
+    # availability that are actually long enough to play in. Include warm-up
+    # and changeover in the estimate -- a slot that only just fits is no use.
+    match_formats: Dict[str, dict] = field(default_factory=lambda: {
+        "one_set": {"label": "One set", "minutes": 60,
+                    "example": "6-4"},
+        "two_sets_tb": {"label": "Two sets + match tie-break", "minutes": 90,
+                        "example": "6-4 4-6 10-8"},
+        "best_of_three": {"label": "Best of three sets", "minutes": 120,
+                          "example": "6-4 3-6 6-2"},
+    })
+    default_match_format: str = "one_set"
+
+    # --- availability and scheduling ------------------------------------
+    # The window the availability grid covers, and how finely it is chopped.
+    # Coarse blocks are deliberate: nobody fills in a 15-minute grid.
+    day_starts_at: int = 8 * 60          # 08:00, in minutes from midnight
+    day_ends_at: int = 22 * 60           # 22:00
+    availability_slot_minutes: int = 60
+    # How far ahead the "block out a specific day" view runs.
+    exception_horizon_days: int = 14
+    # How many suggested times to offer when two players look for a match.
+    suggestion_count: int = 6
 
     # --- challenge rules (advisory: shown in the UI, never enforced) ----
     challenge_up_positions: int = 3     # you may challenge up to N spots above you

@@ -10,6 +10,7 @@ import html
 from datetime import date
 from typing import Iterable, List, Optional, Sequence
 
+from . import availability as av
 from . import divisions as div
 from .engine import Ladder, PartnerStat, RatingPoint
 from .scoring import flip_score
@@ -147,6 +148,11 @@ figcaption { color:var(--ink-2); font-size:13px; margin-bottom:10px; }
 .chem { font-variant-numeric:tabular-nums; font-weight:600; }
 .chem.pos { color:var(--good-ink); }
 .chem.neg { color:var(--critical); }
+
+table.grid td, table.grid th { padding:3px 6px; border-bottom:1px solid var(--grid); }
+table.grid input[type=checkbox] { margin:0; width:18px; height:18px; }
+table.grid th { text-align:center; }
+h3 { font-size:15px; margin:20px 0 8px; }
 """
 
 
@@ -167,9 +173,12 @@ def page(
 
     links = [
         nav_link("/", "ladder", "Ladders"),
-        nav_link("/submit", "submit", "Submit result"),
+        nav_link("/tournaments", "tournaments", "Tournaments"),
+        nav_link("/schedule", "schedule", "Arrange"),
+        nav_link("/availability", "availability", "My times"),
+        nav_link("/submit", "submit", "Submit"),
         nav_link("/pending", "pending", "Confirm"),
-        nav_link("/matches", "matches", "Matches"),
+        nav_link("/matches", "matches", "History"),
         nav_link("/admin", "admin", "Admin"),
     ]
     if player:
@@ -458,6 +467,193 @@ def partner_table(stats: Sequence[PartnerStat], names: dict) -> str:
 does than the four players' ratings predict, per match. Positive means you
 over-perform together &mdash; which plain W&ndash;L can't tell you, because it
 doesn't know how hard the matches were.</p>"""
+
+
+# -------------------------------------------------------------- availability
+def availability_grid(weekly: dict, blocks: Sequence[tuple]) -> str:
+    """The 'usual week' grid: tick the blocks you're normally free.
+
+    Deliberately coarse. Nobody fills in a 15-minute planner, and a rough
+    pattern plus one-tap exceptions beats an exact one nobody updates.
+    """
+    header = "".join(f"<th>{esc(day)}</th>" for day in av.WEEKDAY_SHORT)
+    rows = []
+    for start, end in blocks:
+        cells = []
+        for weekday in range(7):
+            checked = " checked" if av.covers(weekly.get(weekday, []), (start, end)) else ""
+            cells.append(
+                f'<td style="text-align:center;padding:4px">'
+                f'<input type="checkbox" name="slot" '
+                f'value="{weekday}-{start}-{end}"{checked} '
+                f'aria-label="{esc(av.WEEKDAYS[weekday])} {esc(av.clock(start))}">'
+                f"</td>")
+        rows.append(
+            f'<tr><td style="white-space:nowrap;color:var(--ink-2);font-size:13px">'
+            f"{esc(av.clock(start))}</td>{''.join(cells)}</tr>")
+    return (f'<div class="scroll"><table class="grid"><thead><tr><th></th>{header}'
+            f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>")
+
+
+def upcoming_days(
+    availability: "av.Availability", days: Sequence, csrf: str
+) -> str:
+    """The next couple of weeks, resolved, with one-tap 'can't make it'.
+
+    This is the half that keeps the pattern honest -- blocking a single
+    afternoon has to be quicker than editing your whole week, or it won't
+    happen and the suggestions go stale.
+    """
+    rows = []
+    for day in days:
+        free = availability.on(day)
+        label = day.strftime("%a %d %b")
+        key = day.isoformat()
+        # Only offer "undo" where there is actually something to undo -- a day
+        # you were simply never free on has nothing blocked.
+        has_exception = bool(availability.blocked.get(key)
+                             or availability.extra.get(key))
+        if not free:
+            undo = f"""<form method="post" action="/availability/day" style="margin:0">
+  <input type="hidden" name="csrf" value="{esc(csrf)}">
+  <input type="hidden" name="on_date" value="{key}">
+  <button class="small ghost" name="action" value="restore">Undo</button>
+</form>""" if has_exception else ""
+            note = ("blocked out" if has_exception
+                    else "not in your usual week")
+            rows.append(f"""<tr><td style="white-space:nowrap">{esc(label)}</td>
+<td class="empty">{note}</td><td>{undo}</td></tr>""")
+            continue
+        chips = " ".join(
+            f'<span class="pill">{esc(av.clock(s))}&ndash;{esc(av.clock(e))}</span>'
+            for s, e in free)
+        rows.append(f"""<tr><td style="white-space:nowrap">{esc(label)}</td>
+<td>{chips}</td>
+<td><form method="post" action="/availability/day" style="margin:0">
+  <input type="hidden" name="csrf" value="{esc(csrf)}">
+  <input type="hidden" name="on_date" value="{day.isoformat()}">
+  <button class="small ghost" name="action" value="block">Can't make it</button>
+</form></td></tr>""")
+    return ('<div class="scroll"><table><thead><tr><th>Day</th><th>Free</th>'
+            "<th></th></tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
+
+
+def suggestion_list(slots: Sequence, opponent, division: str, csrf: str,
+                    match_format: str) -> str:
+    """Times both players can play, each a one-click request."""
+    if not slots:
+        return ('<p class="empty">No overlap in the next couple of weeks. '
+                'Either one of you hasn\'t set availability, or your weeks '
+                'genuinely don\'t meet &mdash; you can still propose a time '
+                'below.</p>')
+    buttons = []
+    for slot in slots:
+        buttons.append(f"""<form method="post" action="/request" style="margin:0">
+  <input type="hidden" name="csrf" value="{esc(csrf)}">
+  <input type="hidden" name="opponent" value="{opponent.id}">
+  <input type="hidden" name="division" value="{esc(division)}">
+  <input type="hidden" name="match_format" value="{esc(match_format)}">
+  <input type="hidden" name="starts_at"
+         value="{slot.starts_at.strftime('%Y-%m-%dT%H:%M')}">
+  <button class="small ghost" type="submit">{esc(slot.label())}</button>
+</form>""")
+    return f'<div class="row">{"".join(buttons)}</div>'
+
+
+def request_rows(requests: Sequence, names: dict, viewer_id: int, csrf: str,
+                 kind: str) -> str:
+    """kind: 'inbox' (answer it), 'outbox' (cancel it), 'agreed'."""
+    if not requests:
+        return '<p class="empty">Nothing here.</p>'
+    rows = []
+    for r in requests:
+        other = names.get(r.other(viewer_id), "?")
+        when = r.when.strftime("%a %d %b, %-I:%M%p").lower().replace(":00", "")
+        note = f'<div class="hint">&ldquo;{esc(r.message)}&rdquo;</div>' if r.message else ""
+        if kind == "inbox":
+            actions = f"""<form method="post" action="/request/respond" class="row"
+   style="gap:6px;margin:0">
+  <input type="hidden" name="csrf" value="{esc(csrf)}">
+  <input type="hidden" name="request_id" value="{r.id}">
+  <button class="small" name="action" value="accept">Accept</button>
+  <button class="small ghost" name="action" value="decline">Decline</button>
+</form>"""
+        else:
+            actions = f"""<form method="post" action="/request/respond" style="margin:0">
+  <input type="hidden" name="csrf" value="{esc(csrf)}">
+  <input type="hidden" name="request_id" value="{r.id}">
+  <button class="small ghost" name="action" value="cancel">Cancel</button>
+</form>"""
+        rows.append(f"""<tr>
+  <td style="white-space:nowrap">{esc(when)}</td>
+  <td><a href="/player/{r.other(viewer_id)}">{esc(other)}</a>
+      <span class="pill">{esc(div.get(r.division).short)}</span>{note}</td>
+  <td style="white-space:nowrap;color:var(--ink-2)">{r.minutes} min</td>
+  <td>{actions}</td>
+</tr>""")
+    return ('<div class="scroll"><table><tbody>' + "".join(rows)
+            + "</tbody></table></div>")
+
+
+# -------------------------------------------------------------- tournaments
+def bracket_view(rounds: Sequence, matches: Sequence, names: dict) -> str:
+    """Knockout draw, one column per round."""
+    by_round: dict = {}
+    for m in matches:
+        by_round.setdefault(m.round_no, []).append(m)
+
+    columns = []
+    for rnd in rounds:
+        cells = []
+        for m in sorted(by_round.get(rnd.round_no, []), key=lambda x: x.slot):
+            cells.append(_bracket_cell(m, names))
+        overdue = (' <span class="pill" style="color:var(--critical)">overdue</span>'
+                   if rnd.is_overdue else "")
+        deadline = (f'<div class="hint">by {esc(rnd.deadline)}</div>'
+                    if rnd.deadline else "")
+        columns.append(
+            f'<div style="min-width:200px;flex:1">'
+            f'<h3 style="font-size:14px;margin:0 0 4px">{esc(rnd.name)}{overdue}</h3>'
+            f"{deadline}{''.join(cells)}</div>")
+    return (f'<div class="scroll"><div style="display:flex;gap:16px;'
+            f'align-items:flex-start;min-width:min-content">'
+            f"{''.join(columns)}</div></div>")
+
+
+def _bracket_cell(match, names: dict) -> str:
+    is_bye = match.status == "bye"
+
+    def side(pid, is_winner):
+        if pid is None:
+            return ('<span class="empty">bye</span>' if is_bye
+                    else '<span class="empty">&mdash;</span>')
+        name = esc(names.get(pid, "?"))
+        link = f'<a href="/player/{pid}">{name}</a>'
+        return f"<b>{link}</b>" if is_winner else link
+
+    won = match.winner_id
+    tone = "var(--good)" if won else "var(--border)"
+    return (f'<div class="card" style="padding:8px 10px;margin:0 0 8px;'
+            f'border-left:3px solid {tone}">'
+            f'<div>{side(match.player_a, won == match.player_a)}</div>'
+            f'<div>{side(match.player_b, won == match.player_b)}</div></div>')
+
+
+def standings_table(rows: Sequence, names: dict) -> str:
+    if not rows:
+        return '<p class="empty">No results yet.</p>'
+    body = "".join(f"""<tr>
+  <td class="rank">{i}</td>
+  <td class="name"><a href="/player/{s.player_id}">{esc(names.get(s.player_id,'?'))}</a></td>
+  <td class="num">{s.played}</td>
+  <td class="num">{s.record}</td>
+  <td class="num">{s.games_won}&ndash;{s.games_lost}</td>
+  <td class="num">{s.games_diff:+d}</td>
+</tr>""" for i, s in enumerate(rows, start=1))
+    return (f'<div class="scroll"><table><thead><tr><th>#</th><th>Player</th>'
+            f'<th class="num">P</th><th class="num">W&ndash;L</th>'
+            f'<th class="num">Games</th><th class="num">Diff</th></tr></thead>'
+            f"<tbody>{body}</tbody></table></div>")
 
 
 # ------------------------------------------------------------------- pickers

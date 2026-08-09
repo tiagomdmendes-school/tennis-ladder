@@ -17,7 +17,7 @@ import sqlite3
 from datetime import date
 from typing import Callable, List
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Divisions can't be inferred for matches recorded before divisions existed --
 # every one of them was singles, but nothing recorded which category. They go
@@ -116,6 +116,98 @@ CREATE INDEX IF NOT EXISTS idx_matches_b2      ON matches(player_b2);
 """
 
 
+SCHEMA_V2 = """
+-- When people are normally free, as a weekly pattern (Mon = 0).
+CREATE TABLE IF NOT EXISTS availability (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id   INTEGER NOT NULL REFERENCES players(id),
+    weekday     INTEGER NOT NULL,
+    start_min   INTEGER NOT NULL,
+    end_min     INTEGER NOT NULL
+);
+
+-- One-off differences from that pattern on a specific date.
+-- available = 0 blocks time out, 1 adds time that isn't in the usual week.
+CREATE TABLE IF NOT EXISTS availability_exception (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id   INTEGER NOT NULL REFERENCES players(id),
+    on_date     TEXT    NOT NULL,
+    start_min   INTEGER NOT NULL,
+    end_min     INTEGER NOT NULL,
+    available   INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS match_requests (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    division            TEXT    NOT NULL,
+    from_player         INTEGER NOT NULL REFERENCES players(id),
+    to_player           INTEGER NOT NULL REFERENCES players(id),
+    starts_at           TEXT    NOT NULL,
+    minutes             INTEGER NOT NULL,
+    match_format        TEXT    NOT NULL,
+    status              TEXT    NOT NULL DEFAULT 'pending',
+    message             TEXT    NOT NULL DEFAULT '',
+    tournament_match_id INTEGER REFERENCES tournament_matches(id),
+    created_at          TEXT    NOT NULL,
+    responded_at        TEXT
+);
+
+CREATE TABLE IF NOT EXISTS tournaments (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT    NOT NULL,
+    division      TEXT    NOT NULL,
+    season_id     INTEGER NOT NULL REFERENCES seasons(id),
+    style         TEXT    NOT NULL,
+    seeding       TEXT    NOT NULL,
+    match_format  TEXT    NOT NULL,
+    status        TEXT    NOT NULL DEFAULT 'setup',
+    created_at    TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tournament_entries (
+    tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+    player_id     INTEGER NOT NULL REFERENCES players(id),
+    seed          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (tournament_id, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS tournament_rounds (
+    tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+    round_no      INTEGER NOT NULL,
+    name          TEXT    NOT NULL DEFAULT '',
+    deadline      TEXT,
+    PRIMARY KEY (tournament_id, round_no)
+);
+
+CREATE TABLE IF NOT EXISTS tournament_matches (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+    round_no      INTEGER NOT NULL,
+    slot          INTEGER NOT NULL,
+    player_a      INTEGER REFERENCES players(id),
+    player_b      INTEGER REFERENCES players(id),
+    winner_id     INTEGER REFERENCES players(id),
+    match_id      INTEGER REFERENCES matches(id),
+    status        TEXT    NOT NULL DEFAULT 'pending'
+);
+
+CREATE INDEX IF NOT EXISTS idx_avail_player   ON availability(player_id);
+CREATE INDEX IF NOT EXISTS idx_exc_player     ON availability_exception(player_id, on_date);
+CREATE INDEX IF NOT EXISTS idx_req_to         ON match_requests(to_player, status);
+CREATE INDEX IF NOT EXISTS idx_req_from       ON match_requests(from_player, status);
+CREATE INDEX IF NOT EXISTS idx_tmatch_tourney ON tournament_matches(tournament_id, round_no);
+"""
+
+
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    """Add availability, match requests and tournaments.
+
+    Purely additive -- no existing table changes shape, so there is nothing to
+    copy and nothing that can go wrong with existing results.
+    """
+    conn.executescript(SCHEMA_V2)
+
+
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
@@ -188,6 +280,7 @@ def _migrate_v0_to_v1(conn: sqlite3.Connection) -> None:
 
 MIGRATIONS: List[Callable[[sqlite3.Connection], None]] = [
     _migrate_v0_to_v1,      # index 0 upgrades version 0 -> 1
+    _migrate_v1_to_v2,      # index 1 upgrades version 1 -> 2
 ]
 
 
@@ -199,6 +292,7 @@ def migrate(conn: sqlite3.Connection) -> int:
     if started_at == 0 and not _table_exists(conn, "players"):
         # A brand-new database: create the current schema directly.
         conn.executescript(SCHEMA_V1)
+        conn.executescript(SCHEMA_V2)
         _ensure_season(conn)
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
@@ -209,6 +303,7 @@ def migrate(conn: sqlite3.Connection) -> int:
         conn.execute(f"PRAGMA user_version = {version + 1}")
     # Bring an already-current database in line with any added indexes.
     conn.executescript(SCHEMA_V1)
+    conn.executescript(SCHEMA_V2)
     _ensure_season(conn)
     conn.commit()
     return started_at

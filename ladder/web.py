@@ -12,19 +12,24 @@ import json
 import re
 import secrets
 import urllib.parse
+from datetime import date, timedelta
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, List, Optional, Tuple
 
+from . import availability as av
 from . import divisions as div
+from . import tournaments as T
 from .config import CONFIG, Config
 from .mailer import KIND_HINTS, KIND_LABELS, Mailer, verify_unsubscribe
+from .scheduling import SchedulingError
 from .service import LadderService, ServiceError
 from .storage import CONFIRMED, PENDING, Database
 from .views import (
-    category_options, division_nav, division_options, esc, ladder_table,
-    match_rows, page, partner_table, player_options, rating_chart,
-    season_picker, today_iso,
+    availability_grid, bracket_view, category_options, division_nav,
+    division_options, esc, ladder_table, match_rows, page, partner_table,
+    player_options, rating_chart, request_rows, season_picker,
+    standings_table, suggestion_list, today_iso, upcoming_days,
 )
 
 COOKIE_NAME = "ladder_session"
@@ -468,10 +473,11 @@ this list in full each time a ladder is drawn.</p>
             if viewer and viewer.id != pid:
                 wins, losses, meetings = engine.head_to_head(viewer.id, pid)
                 h2h = f"""<div class="card"><h2 style="margin-top:0">You vs
-{esc(player.name)}</h2><p class="sub" style="margin:0">
+{esc(player.name)}</h2><p class="sub" style="margin:0 0 12px">
 Head to head across all divisions: <b>{wins}&ndash;{losses}</b> in
 {len(meetings)} match{'es' if len(meetings) != 1 else ''} on opposite sides.
-</p></div>"""
+</p><a class="btn small" href="/find/{pid}?division={esc(played_in[0])}">
+Find a time to play</a></div>"""
 
             partners = engine.partners_of(pid, season_id)
             matches = app.db.list_matches(status=CONFIRMED, player_id=pid,
@@ -580,6 +586,354 @@ Head to head across all divisions: <b>{wins}&ndash;{losses}</b> in
 &ldquo;{esc(KIND_LABELS[kind])}&rdquo; emails. Your other notification settings
 are unchanged &mdash; adjust them any time in
 <a href="/me">your settings</a>.</p>"""))
+
+        # ---------------------------------------------------- availability
+        @self.route("GET", "/availability")
+        def availability_page(req: Request) -> Response:
+            viewer = app.viewer(req)
+            if not viewer:
+                req.flash("warn", "Sign in to set when you can play.")
+                return redirect("/login")
+            cfg = app.config
+            mine = app.db.get_availability(viewer.id)
+            blocks = av.slot_grid(cfg.day_starts_at, cfg.day_ends_at,
+                                  cfg.availability_slot_minutes)
+            horizon = [date.today() + timedelta(days=i)
+                       for i in range(cfg.exception_horizon_days)]
+
+            body = f"""<h1>When can you play?</h1>
+<p class="sub">Set your usual week once. It's used to suggest times you and an
+opponent are both free, so matches can happen outside practice. Rough is fine
+&mdash; you confirm an actual time with the other player before anything is
+booked.</p>
+
+<div class="card"><h2 style="margin-top:0">Your usual week</h2>
+<p class="sub">Currently: <b>{esc(av.describe_week(mine.weekly))}</b></p>
+<form method="post" action="/availability">
+<input type="hidden" name="csrf" value="{esc(req.csrf)}">
+{availability_grid(mine.weekly, blocks)}
+<div class="row" style="margin-top:14px"><button type="submit">Save my week</button></div>
+</form></div>
+
+<div class="card"><h2 style="margin-top:0">Next {cfg.exception_horizon_days} days</h2>
+<p class="sub">This is your week applied to real dates. Something come up?
+Block a day here without touching your usual pattern.</p>
+{upcoming_days(mine, horizon, req.csrf)}</div>"""
+            return Response(app.render(req, "Availability", body, "availability"))
+
+        @self.route("POST", "/availability")
+        def availability_save(req: Request) -> Response:
+            viewer = app.viewer(req)
+            if not viewer or not req.check_csrf():
+                req.flash("err", "Sign in again to save your availability.")
+                return redirect("/login")
+            weekly = av.intervals_from_slots(req.form_multi.get("slot", []))
+            app.db.set_weekly_availability(viewer.id, weekly)
+            req.flash("ok", "Saved. " + (
+                f"You're free {esc(av.describe_week(weekly))}."
+                if weekly else "You've cleared your whole week."))
+            return redirect("/availability")
+
+        @self.route("POST", "/availability/day")
+        def availability_day(req: Request) -> Response:
+            viewer = app.viewer(req)
+            if not viewer or not req.check_csrf():
+                req.flash("err", "Sign in again to change your availability.")
+                return redirect("/login")
+            on_date = req.get("on_date")
+            if req.get("action") == "restore":
+                app.db.clear_exceptions(viewer.id, on_date)
+                req.flash("ok", f"Restored your usual week on {esc(on_date)}.")
+            else:
+                # Block the whole day: one tap is the point.
+                app.db.add_exception(viewer.id, on_date, 0, 24 * 60,
+                                     available=False)
+                req.flash("ok", f"Blocked out {esc(on_date)}.")
+            return redirect("/availability")
+
+        # ------------------------------------------------------- scheduling
+        @self.route("GET", "/schedule")
+        def schedule_page(req: Request) -> Response:
+            viewer = app.viewer(req)
+            if not viewer:
+                req.flash("warn", "Sign in to arrange matches.")
+                return redirect("/login")
+            names = {p.id: p.name for p in app.db.list_players()}
+            sched = app.service.scheduler
+            nudge = ""
+            if not sched.has_availability(viewer.id):
+                nudge = ('<div class="flash warn">You haven\'t set your '
+                         'availability, so nobody can be offered a time that '
+                         'works for you. <a href="/availability">Set it now</a> '
+                         '&mdash; it takes a minute.</div>')
+            body = f"""{nudge}<h1>Matches</h1>
+<p class="sub">Ask someone for a game at a time you're both free. Pick an
+opponent from the ladder and you'll be shown the overlaps.</p>
+
+<h2>Waiting on you</h2>
+<div class="card">{request_rows(sched.inbox(viewer.id), names, viewer.id,
+                                req.csrf, 'inbox')}</div>
+
+<h2>Agreed</h2>
+<div class="card">{request_rows(sched.scheduled(viewer.id), names, viewer.id,
+                                req.csrf, 'agreed')}</div>
+
+<h2>You asked</h2>
+<div class="card">{request_rows(sched.outbox(viewer.id), names, viewer.id,
+                                req.csrf, 'outbox')}</div>
+
+<p class="sub">To ask someone, open their profile from a ladder and hit
+<b>Find a time</b>.</p>"""
+            return Response(app.render(req, "Matches", body, "schedule"))
+
+        @self.route("GET", r"/find/(\d+)")
+        def find_time(req: Request, player_id: str) -> Response:
+            viewer = app.viewer(req)
+            if not viewer:
+                req.flash("warn", "Sign in to arrange a match.")
+                return redirect("/login")
+            opponent = app.db.get_player(int(player_id))
+            if not opponent or opponent.id == viewer.id:
+                req.flash("err", "Pick someone else to play.")
+                return redirect("/")
+            division = app.current_division(req)
+            match_format = req.get("format") or app.config.default_match_format
+            sched = app.service.scheduler
+            slots = sched.suggest(viewer.id, opponent.id, match_format=match_format)
+
+            missing = []
+            if not sched.has_availability(viewer.id):
+                missing.append("you haven't")
+            if not sched.has_availability(opponent.id):
+                missing.append(f"{esc(opponent.name)} hasn't")
+            warn = (f'<div class="flash warn">{" and ".join(missing)} set '
+                    'availability yet, so there\'s nothing to match up.'
+                    ' <a href="/availability">Set yours</a>.</div>'
+                    if missing else "")
+
+            formats = "".join(
+                f'<option value="{esc(key)}"'
+                f'{" selected" if key == match_format else ""}>'
+                f'{esc(spec["label"])} (~{spec["minutes"]} min)</option>'
+                for key, spec in app.config.match_formats.items())
+
+            body = f"""{warn}<h1>Play {esc(opponent.name)}</h1>
+<p class="sub">Times you're both free for a
+<b>{esc(app.service.scheduler.format_label(match_format))}</b>, soonest first.
+Picking one sends {esc(opponent.name)} a request &mdash; nothing is booked
+until they accept.</p>
+
+<div class="card"><form method="get" action="/find/{opponent.id}" class="row">
+  <input type="hidden" name="division" value="{esc(division)}">
+  <label for="format" style="margin:0 8px 0 0">Format</label>
+  <select id="format" name="format" style="width:auto"
+          onchange="this.form.submit()">{formats}</select>
+  <noscript><button class="small ghost">Update</button></noscript>
+</form></div>
+
+<h2>Suggested times</h2>
+<div class="card">{suggestion_list(slots, opponent, division, req.csrf,
+                                   match_format)}</div>
+
+<h2>Or propose your own</h2>
+<div class="card"><form class="stack" method="post" action="/request">
+<input type="hidden" name="csrf" value="{esc(req.csrf)}">
+<input type="hidden" name="opponent" value="{opponent.id}">
+<input type="hidden" name="division" value="{esc(division)}">
+<input type="hidden" name="match_format" value="{esc(match_format)}">
+<div><label for="starts_at">Date and time</label>
+<input id="starts_at" name="starts_at" type="datetime-local" required></div>
+<div><label for="message">Message (optional)</label>
+<input id="message" name="message" placeholder="Courts are free after 4"></div>
+<div class="row"><button type="submit">Send request</button>
+<a class="btn ghost" href="/player/{opponent.id}">Back</a></div>
+</form></div>"""
+            return Response(app.render(req, f"Play {opponent.name}", body,
+                                       "schedule"))
+
+        @self.route("POST", "/request")
+        def send_request(req: Request) -> Response:
+            viewer = app.viewer(req)
+            if not viewer or not req.check_csrf():
+                req.flash("err", "Sign in again to send a request.")
+                return redirect("/login")
+            opponent_id = req.get_int("opponent")
+            if opponent_id is None:
+                return redirect("/schedule")
+            try:
+                request = app.service.scheduler.request_match(
+                    division=req.get("division") or app.config.enabled_divisions[0],
+                    from_player=viewer.id, to_player=opponent_id,
+                    starts_at=req.get("starts_at"),
+                    match_format=req.get("match_format"),
+                    message=req.get("message"))
+            except SchedulingError as exc:
+                req.flash("err", esc(str(exc)))
+                return redirect(f"/find/{opponent_id}")
+            opponent = app.db.get_player(opponent_id)
+            when = request.when.strftime("%a %d %b at %H:%M")
+            req.flash("ok", f"Asked {esc(opponent.name if opponent else 'them')} "
+                            f"for {esc(when)}. It's on once they accept.")
+            return redirect("/schedule")
+
+        @self.route("POST", "/request/respond")
+        def respond_request(req: Request) -> Response:
+            viewer = app.viewer(req)
+            if not viewer or not req.check_csrf():
+                req.flash("err", "Sign in again.")
+                return redirect("/login")
+            request_id = req.get_int("request_id")
+            action = req.get("action")
+            if request_id is None:
+                return redirect("/schedule")
+            try:
+                if action == "cancel":
+                    app.service.scheduler.cancel(request_id, viewer.id)
+                    req.flash("ok", "Cancelled.")
+                else:
+                    accepted = action == "accept"
+                    app.service.scheduler.respond(request_id, viewer.id, accepted)
+                    req.flash("ok", "Match agreed. Turn up and play, then submit "
+                                    "the result." if accepted else "Declined.")
+            except SchedulingError as exc:
+                req.flash("err", esc(str(exc)))
+            return redirect("/schedule")
+
+        # ------------------------------------------------------ tournaments
+        @self.route("GET", "/tournaments")
+        def tournaments_page(req: Request) -> Response:
+            season = app.db.current_season()
+            events = app.db.list_tournaments(season.id)
+            if not events:
+                body = ("<h1>Tournaments</h1><p class='sub'>None yet. An admin "
+                        "can start one from <a href='/admin'>Admin</a> &mdash; "
+                        "seeded off the ladder, or a random draw.</p>")
+                return Response(app.render(req, "Tournaments", body, "tournaments"))
+            rows = "".join(f"""<tr>
+  <td class="name"><a href="/tournament/{t.id}">{esc(t.name)}</a></td>
+  <td><span class="pill">{esc(div.get(t.division).short)}</span></td>
+  <td>{esc(T.STYLE_LABELS.get(t.style, t.style))}</td>
+  <td><span class="pill">{esc(t.status)}</span></td>
+</tr>""" for t in events)
+            body = f"""<h1>Tournaments</h1>
+<p class="sub">{esc(season.name)}. Rounds have a play-by date; you arrange the
+actual times between yourselves.</p>
+<div class="card scroll"><table><thead><tr><th>Name</th><th></th>
+<th>Format</th><th>Status</th></tr></thead><tbody>{rows}</tbody></table></div>"""
+            return Response(app.render(req, "Tournaments", body, "tournaments"))
+
+        @self.route("GET", r"/tournament/(\d+)")
+        def tournament_page(req: Request, tournament_id: str) -> Response:
+            tournament = app.db.get_tournament(int(tournament_id))
+            if not tournament:
+                return Response(app.render(req, "Unknown tournament",
+                                           "<h1>No such tournament</h1>"), status=404)
+            names = {p.id: p.name for p in app.db.list_players()}
+            rounds = app.db.rounds(tournament.id)
+            matches = app.db.tournament_matches(tournament.id)
+            viewer = app.viewer(req)
+
+            if tournament.style == T.ELIMINATION:
+                main = ('<h2>Draw</h2><div class="card">'
+                        + bracket_view(rounds, matches, names) + "</div>")
+            else:
+                main = ('<h2>Standings</h2><div class="card">'
+                        + standings_table(app.service.tournament_standings(tournament.id),
+                                          names) + "</div>")
+
+            yours = ""
+            if viewer:
+                mine = [m for m in matches
+                        if viewer.id in m.players and m.winner_id is None
+                        and m.is_ready]
+                if mine:
+                    cards = []
+                    for m in mine:
+                        opponent = [p for p in m.players if p != viewer.id][0]
+                        deadline = next((r.deadline for r in rounds
+                                         if r.round_no == m.round_no), None)
+                        cards.append(
+                            f'<p class="sub" style="margin:0 0 8px">You play '
+                            f'<b>{esc(names.get(opponent, "?"))}</b>'
+                            + (f", by <b>{esc(deadline)}</b>" if deadline else "")
+                            + f'. <a href="/find/{opponent}?division='
+                            f'{esc(tournament.division)}&format='
+                            f'{esc(tournament.match_format)}">Find a time</a></p>')
+                    yours = ('<div class="card"><h2 style="margin-top:0">Your next '
+                             'match</h2>' + "".join(cards) + "</div>")
+
+            overdue = ""
+            if app.require_admin(req):
+                late = app.service.overdue_matches(tournament.id)
+                if late:
+                    items = []
+                    for m in late:
+                        options = "".join(
+                            f'<button class="small ghost" name="winner_id" '
+                            f'value="{pid}">{esc(names.get(pid,"?"))} advances</button>'
+                            for pid in m.players)
+                        items.append(f"""<li style="margin-bottom:8px">
+{esc(names.get(m.player_a,'?'))} v {esc(names.get(m.player_b,'?'))}
+<form method="post" action="/admin/tournament" class="row"
+      style="gap:6px;margin:4px 0 0">
+  <input type="hidden" name="csrf" value="{esc(req.csrf)}">
+  <input type="hidden" name="action" value="force">
+  <input type="hidden" name="tmatch_id" value="{m.id}">
+  {options}</form></li>""")
+                    overdue = (f'<div class="flash warn"><b>{len(late)} match'
+                               f'{"es" if len(late) != 1 else ""} past the round '
+                               f'deadline.</b> Nothing happens automatically '
+                               f'&mdash; extend the round, or send someone '
+                               f'through:<ul>{"".join(items)}</ul></div>')
+
+            deadlines = "".join(
+                f'<tr><td>{esc(r.name)}</td><td>{esc(r.deadline or "&mdash;")}</td>'
+                f'<td>{"<span class=\'pill\'>overdue</span>" if r.is_overdue else ""}</td></tr>'
+                for r in rounds)
+
+            body = f"""{overdue}<h1>{esc(tournament.name)}</h1>
+<p class="sub">{esc(div.get(tournament.division).label)} &middot;
+{esc(T.STYLE_LABELS.get(tournament.style, tournament.style))} &middot;
+seeded {esc(T.SEEDING_LABELS.get(tournament.seeding, tournament.seeding).lower())}
+&middot; {esc(app.service.scheduler.format_label(tournament.match_format))}
+&middot; <span class="pill">{esc(tournament.status)}</span></p>
+{yours}
+{main}
+<h2>Rounds</h2>
+<div class="card scroll"><table><thead><tr><th>Round</th><th>Play by</th>
+<th></th></tr></thead><tbody>{deadlines}</tbody></table></div>
+<p class="sub">Results go in the normal way &mdash; submit the score from
+<a href="/submit">Submit result</a> and the draw updates itself. Tournament
+matches count towards your ladder rating like any other match.</p>"""
+            return Response(app.render(req, tournament.name, body, "tournaments"))
+
+        @self.route("POST", "/admin/tournament")
+        def admin_tournament(req: Request) -> Response:
+            if not app.require_admin(req) or not req.check_csrf():
+                req.flash("err", "Admin access required.")
+                return redirect("/login")
+            action = req.get("action")
+            if action == "force":
+                tmatch_id = req.get_int("tmatch_id")
+                winner_id = req.get_int("winner_id")
+                if tmatch_id and winner_id:
+                    app.service.force_tournament_winner(tmatch_id, winner_id)
+                    req.flash("ok", "Sent them through.")
+                tmatch = app.db.get_tournament_match(tmatch_id or 0)
+                return redirect(f"/tournament/{tmatch.tournament_id}" if tmatch
+                                else "/tournaments")
+            if action == "create":
+                entrants = [int(v) for v in req.form_multi.get("entrant", []) if v]
+                tournament = app.service.create_tournament(
+                    name=req.get("name"), division=req.get("division"),
+                    style=req.get("style"), seeding=req.get("seeding"),
+                    match_format=req.get("match_format"),
+                    player_ids=entrants,
+                    round_days=req.get_int("round_days") or 7)
+                req.flash("ok", f"{esc(tournament.name)} created with "
+                                f"{len(entrants)} players.")
+                return redirect(f"/tournament/{tournament.id}")
+            return redirect("/admin")
 
         # ----------------------------------------------------------- login
         @self.route("GET", "/login")
@@ -745,6 +1099,24 @@ new one.</p>
             pending = app.db.list_matches(status=PENDING)
             recent = app.db.list_matches(limit=25)
             seasons = app.db.seasons()
+
+            singles = [d for d in app.enabled() if not div.get(d).is_doubles]
+            singles_options = "".join(
+                f'<option value="{k}">{esc(div.get(k).label)}</option>'
+                for k in singles)
+            format_options = "".join(
+                f'<option value="{esc(k)}"'
+                f'{" selected" if k == app.config.default_match_format else ""}>'
+                f'{esc(spec["label"])} (~{spec["minutes"]} min)</option>'
+                for k, spec in app.config.match_formats.items())
+            entrant_boxes = "".join(
+                f'<label style="font-weight:400;display:block;margin-bottom:4px">'
+                f'<input type="checkbox" name="entrant" value="{p.id}">'
+                f'{esc(p.name)} '
+                f'<span class="hint" style="display:inline">'
+                f'{esc(div.CATEGORY_LABELS.get(p.category, ""))}</span></label>'
+                for p in players if p.active) or \
+                '<p class="empty">Add some players first.</p>'
             current = app.db.current_season()
             season_rows = "".join(
                 f'<tr><td class="name">{esc(s.name)}</td><td>{esc(s.starts_on)}</td>'
@@ -785,6 +1157,42 @@ recalculates every rating that came after it.</p>
   <div class="row"><button name="action" value="start">Start new season</button></div>
 </form></div>
 </div>
+
+<div class="card"><h2 style="margin-top:0">New tournament</h2>
+<form class="stack" method="post" action="/admin/tournament" style="max-width:none">
+  <input type="hidden" name="csrf" value="{esc(req.csrf)}">
+  <input type="hidden" name="action" value="create">
+  <div class="grid2">
+    <div><label for="t_name">Name</label>
+      <input id="t_name" name="name" placeholder="Fall Open" required></div>
+    <div><label for="t_division">Division</label>
+      <select id="t_division" name="division">{singles_options}</select>
+      <div class="hint">Singles only for now.</div></div>
+    <div><label for="t_style">Format</label>
+      <select id="t_style" name="style">
+        <option value="round_robin">Round robin &mdash; everyone plays everyone</option>
+        <option value="elimination">Single elimination &mdash; knockout bracket</option>
+      </select></div>
+    <div><label for="t_seeding">Seeding</label>
+      <select id="t_seeding" name="seeding">
+        <option value="ladder">By ladder ranking</option>
+        <option value="random">Random draw</option>
+      </select></div>
+    <div><label for="t_format">Match format</label>
+      <select id="t_format" name="match_format">{format_options}</select>
+      <div class="hint">Sets how long a match is assumed to take when
+      suggesting times.</div></div>
+    <div><label for="t_days">Days per round</label>
+      <input id="t_days" name="round_days" type="number" value="7" min="1"
+             max="60"></div>
+  </div>
+  <div><label>Who's in?</label>
+    <div class="scroll" style="max-height:220px;overflow-y:auto;border:1px solid
+         var(--border);border-radius:8px;padding:10px">{entrant_boxes}</div>
+    <div class="hint">Byes are handed to the top seeds automatically if the
+    field isn't a power of two.</div></div>
+  <div class="row"><button type="submit">Create tournament</button></div>
+</form></div>
 
 <div class="card"><h2 style="margin-top:0">Import results (CSV)</h2>
 <form class="stack" method="post" action="/admin/import" enctype="multipart/form-data"

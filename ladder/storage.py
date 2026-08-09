@@ -15,8 +15,9 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Iterator, List, Optional, Sequence
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
+from .availability import Availability
 from .config import DATA_DIR, DB_PATH
 from .divisions import UNSPECIFIED
 from .migrations import hash_pin, migrate, verify_pin
@@ -27,6 +28,42 @@ REJECTED = "rejected"
 
 SIDE_A = "a"
 SIDE_B = "b"
+
+# Match request lifecycle.
+REQUEST_PENDING = "pending"
+REQUEST_ACCEPTED = "accepted"
+REQUEST_DECLINED = "declined"
+REQUEST_CANCELLED = "cancelled"
+REQUEST_PLAYED = "played"
+
+
+@dataclass
+class MatchRequest:
+    """A proposed time for a match, awaiting the opponent's answer."""
+
+    id: int
+    division: str
+    from_player: int
+    to_player: int
+    starts_at: str
+    minutes: int
+    match_format: str
+    status: str
+    message: str
+    tournament_match_id: Optional[int]
+    created_at: str
+    responded_at: Optional[str]
+
+    @property
+    def when(self) -> datetime:
+        return datetime.fromisoformat(self.starts_at)
+
+    @property
+    def is_past(self) -> bool:
+        return self.when < datetime.now()
+
+    def other(self, player_id: int) -> int:
+        return self.to_player if player_id == self.from_player else self.from_player
 
 
 @dataclass
@@ -47,6 +84,65 @@ class Player:
     def wants(self, kind: str) -> bool:
         """Whether this player opted in to a notification type."""
         return bool(getattr(self, f"notify_{kind}", False)) and bool(self.email)
+
+
+@dataclass
+class Tournament:
+    id: int
+    name: str
+    division: str
+    season_id: int
+    style: str
+    seeding: str
+    match_format: str
+    status: str          # setup -> running -> complete
+    created_at: str
+
+    @property
+    def is_running(self) -> bool:
+        return self.status == "running"
+
+
+@dataclass
+class TournamentRound:
+    round_no: int
+    name: str
+    deadline: Optional[str]
+
+    @property
+    def is_overdue(self) -> bool:
+        if not self.deadline:
+            return False
+        return datetime.strptime(self.deadline, "%Y-%m-%d").date() < date.today()
+
+
+@dataclass
+class TournamentMatch:
+    id: int
+    tournament_id: int
+    round_no: int
+    slot: int
+    player_a: Optional[int]
+    player_b: Optional[int]
+    winner_id: Optional[int]
+    match_id: Optional[int]
+    status: str          # pending | ready | played | bye
+
+    @property
+    def is_ready(self) -> bool:
+        """Both players known and it hasn't been played."""
+        return (self.player_a is not None and self.player_b is not None
+                and self.winner_id is None)
+
+    @property
+    def players(self) -> List[int]:
+        return [p for p in (self.player_a, self.player_b) if p is not None]
+
+    def loser(self) -> Optional[int]:
+        if self.winner_id is None:
+            return None
+        others = [p for p in self.players if p != self.winner_id]
+        return others[0] if others else None
 
 
 @dataclass
@@ -545,6 +641,285 @@ class Database:
                     return match
         return None
 
+    # ----------------------------------------------------------- availability
+    def get_availability(self, player_id: int) -> Availability:
+        """A player's weekly pattern plus any dated exceptions."""
+        weekly: Dict[int, List[tuple]] = {}
+        blocked: Dict[str, List[tuple]] = {}
+        extra: Dict[str, List[tuple]] = {}
+        with self.connect() as conn:
+            for row in conn.execute(
+                "SELECT weekday, start_min, end_min FROM availability"
+                " WHERE player_id = ? ORDER BY weekday, start_min", (player_id,)
+            ):
+                weekly.setdefault(row["weekday"], []).append(
+                    (row["start_min"], row["end_min"]))
+            for row in conn.execute(
+                "SELECT on_date, start_min, end_min, available"
+                " FROM availability_exception WHERE player_id = ?"
+                " ORDER BY on_date, start_min", (player_id,)
+            ):
+                target = extra if row["available"] else blocked
+                target.setdefault(row["on_date"], []).append(
+                    (row["start_min"], row["end_min"]))
+        return Availability(weekly=weekly, blocked=blocked, extra=extra)
+
+    def set_weekly_availability(
+        self, player_id: int, weekly: Dict[int, List[tuple]]
+    ) -> None:
+        """Replace the whole weekly pattern in one go, as the grid posts it."""
+        with self.connect() as conn:
+            conn.execute("DELETE FROM availability WHERE player_id = ?", (player_id,))
+            conn.executemany(
+                "INSERT INTO availability (player_id, weekday, start_min, end_min)"
+                " VALUES (?,?,?,?)",
+                [(player_id, day, start, end)
+                 for day, intervals in weekly.items()
+                 for start, end in intervals],
+            )
+        self._touch()
+
+    def add_exception(self, player_id: int, on_date: str, start: int, end: int,
+                      available: bool = False) -> None:
+        _validate_date(on_date)
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO availability_exception (player_id, on_date,"
+                " start_min, end_min, available) VALUES (?,?,?,?,?)",
+                (player_id, on_date, start, end, int(available)),
+            )
+        self._touch()
+
+    def clear_exceptions(self, player_id: int, on_date: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM availability_exception WHERE player_id = ? AND on_date = ?",
+                (player_id, on_date),
+            )
+        self._touch()
+
+    def prune_exceptions(self, before: str) -> None:
+        """Drop exceptions for dates that have passed -- they can't matter again."""
+        with self.connect() as conn:
+            conn.execute("DELETE FROM availability_exception WHERE on_date < ?",
+                         (before,))
+
+    def players_with_availability(self) -> List[int]:
+        with self.connect() as conn:
+            return [r[0] for r in conn.execute(
+                "SELECT DISTINCT player_id FROM availability")]
+
+    # --------------------------------------------------------- match requests
+    def add_match_request(
+        self, *, division: str, from_player: int, to_player: int,
+        starts_at: str, minutes: int, match_format: str, message: str = "",
+        tournament_match_id: Optional[int] = None,
+    ) -> int:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO match_requests (division, from_player, to_player,"
+                " starts_at, minutes, match_format, status, message,"
+                " tournament_match_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (division, from_player, to_player, starts_at, minutes,
+                 match_format, REQUEST_PENDING, message.strip(),
+                 tournament_match_id, now),
+            )
+            request_id = cur.lastrowid
+        self._touch()
+        return request_id
+
+    def get_match_request(self, request_id: int) -> Optional["MatchRequest"]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM match_requests WHERE id = ?",
+                               (request_id,)).fetchone()
+        return _to_request(row) if row else None
+
+    def list_match_requests(
+        self, *, player_id: Optional[int] = None, status: Optional[str] = None,
+        upcoming_only: bool = False, limit: Optional[int] = None,
+    ) -> List["MatchRequest"]:
+        sql = "SELECT * FROM match_requests"
+        clauses, params = [], []
+        if player_id is not None:
+            clauses.append("(from_player = ? OR to_player = ?)")
+            params.extend([player_id, player_id])
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if upcoming_only:
+            clauses.append("starts_at >= ?")
+            params.append(datetime.now().isoformat(timespec="seconds"))
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY starts_at ASC"
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        with self.connect() as conn:
+            return [_to_request(r) for r in conn.execute(sql, params)]
+
+    def set_request_status(self, request_id: int, status: str) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE match_requests SET status = ?, responded_at = ? WHERE id = ?",
+                (status, now, request_id),
+            )
+        self._touch()
+
+    # ------------------------------------------------------------ tournaments
+    def create_tournament(
+        self, *, name: str, division: str, season_id: int, style: str,
+        seeding: str, match_format: str,
+    ) -> int:
+        if not name.strip():
+            raise ValueError("A tournament needs a name.")
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO tournaments (name, division, season_id, style,"
+                " seeding, match_format, status, created_at)"
+                " VALUES (?,?,?,?,?,?,'setup',?)",
+                (name.strip(), division, season_id, style, seeding,
+                 match_format, now),
+            )
+            tournament_id = cur.lastrowid
+        self._touch()
+        return tournament_id
+
+    def get_tournament(self, tournament_id: int) -> Optional["Tournament"]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM tournaments WHERE id = ?",
+                               (tournament_id,)).fetchone()
+        return _to_tournament(row) if row else None
+
+    def list_tournaments(self, season_id: Optional[int] = None) -> List["Tournament"]:
+        sql = "SELECT * FROM tournaments"
+        params: list = []
+        if season_id is not None:
+            sql += " WHERE season_id = ?"
+            params.append(season_id)
+        sql += " ORDER BY id DESC"
+        with self.connect() as conn:
+            return [_to_tournament(r) for r in conn.execute(sql, params)]
+
+    def set_tournament_status(self, tournament_id: int, status: str) -> None:
+        with self.connect() as conn:
+            conn.execute("UPDATE tournaments SET status = ? WHERE id = ?",
+                         (status, tournament_id))
+        self._touch()
+
+    def set_entries(self, tournament_id: int, player_ids: Sequence[int]) -> None:
+        """Replace the field, storing the seed order given."""
+        with self.connect() as conn:
+            conn.execute("DELETE FROM tournament_entries WHERE tournament_id = ?",
+                         (tournament_id,))
+            conn.executemany(
+                "INSERT INTO tournament_entries (tournament_id, player_id, seed)"
+                " VALUES (?,?,?)",
+                [(tournament_id, pid, seed)
+                 for seed, pid in enumerate(player_ids, start=1)],
+            )
+        self._touch()
+
+    def entries(self, tournament_id: int) -> List[Tuple[int, int]]:
+        """[(player_id, seed)] in seed order."""
+        with self.connect() as conn:
+            return [(r["player_id"], r["seed"]) for r in conn.execute(
+                "SELECT player_id, seed FROM tournament_entries"
+                " WHERE tournament_id = ? ORDER BY seed", (tournament_id,))]
+
+    def set_rounds(self, tournament_id: int,
+                   rounds: Sequence[Tuple[int, str, Optional[str]]]) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM tournament_rounds WHERE tournament_id = ?",
+                         (tournament_id,))
+            conn.executemany(
+                "INSERT INTO tournament_rounds (tournament_id, round_no, name,"
+                " deadline) VALUES (?,?,?,?)",
+                [(tournament_id, no, name, deadline)
+                 for no, name, deadline in rounds],
+            )
+        self._touch()
+
+    def rounds(self, tournament_id: int) -> List["TournamentRound"]:
+        with self.connect() as conn:
+            return [
+                TournamentRound(r["round_no"], r["name"], r["deadline"])
+                for r in conn.execute(
+                    "SELECT * FROM tournament_rounds WHERE tournament_id = ?"
+                    " ORDER BY round_no", (tournament_id,))
+            ]
+
+    def set_round_deadline(self, tournament_id: int, round_no: int,
+                           deadline: Optional[str]) -> None:
+        if deadline:
+            _validate_date(deadline)
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE tournament_rounds SET deadline = ? WHERE tournament_id = ?"
+                " AND round_no = ?", (deadline, tournament_id, round_no))
+        self._touch()
+
+    def replace_tournament_matches(
+        self, tournament_id: int,
+        pairings: Sequence[Tuple[int, int, Optional[int], Optional[int], str]],
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM tournament_matches WHERE tournament_id = ?",
+                         (tournament_id,))
+            conn.executemany(
+                "INSERT INTO tournament_matches (tournament_id, round_no, slot,"
+                " player_a, player_b, status) VALUES (?,?,?,?,?,?)",
+                [(tournament_id, rnd, slot, a, b, status)
+                 for rnd, slot, a, b, status in pairings],
+            )
+        self._touch()
+
+    def tournament_matches(self, tournament_id: int,
+                           round_no: Optional[int] = None) -> List["TournamentMatch"]:
+        sql = "SELECT * FROM tournament_matches WHERE tournament_id = ?"
+        params: list = [tournament_id]
+        if round_no is not None:
+            sql += " AND round_no = ?"
+            params.append(round_no)
+        sql += " ORDER BY round_no, slot"
+        with self.connect() as conn:
+            return [_to_tmatch(r) for r in conn.execute(sql, params)]
+
+    def get_tournament_match(self, tmatch_id: int) -> Optional["TournamentMatch"]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM tournament_matches WHERE id = ?",
+                               (tmatch_id,)).fetchone()
+        return _to_tmatch(row) if row else None
+
+    def update_tournament_match(
+        self, tmatch_id: int, *, player_a: Optional[int] = None,
+        player_b: Optional[int] = None, winner_id: Optional[int] = None,
+        match_id: Optional[int] = None, status: Optional[str] = None,
+    ) -> None:
+        sets, params = [], []
+        for column, value in (("player_a", player_a), ("player_b", player_b),
+                              ("winner_id", winner_id), ("match_id", match_id),
+                              ("status", status)):
+            if value is not None:
+                sets.append(f"{column} = ?")
+                params.append(value)
+        if not sets:
+            return
+        params.append(tmatch_id)
+        with self.connect() as conn:
+            conn.execute(f"UPDATE tournament_matches SET {', '.join(sets)}"
+                         " WHERE id = ?", params)
+        self._touch()
+
+    def tournament_match_for_match(self, match_id: int) -> Optional["TournamentMatch"]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM tournament_matches WHERE match_id = ?",
+                (match_id,)).fetchone()
+        return _to_tmatch(row) if row else None
+
     # --------------------------------------------------------------- sessions
     def save_session(self, token: str, player_id: Optional[int],
                      is_admin: bool, csrf: str) -> None:
@@ -596,6 +971,35 @@ def _to_player(row: sqlite3.Row) -> Player:
         notify_result=bool(row["notify_result"]),
         notify_weekly=bool(row["notify_weekly"]),
         notify_season=bool(row["notify_season"]),
+    )
+
+
+def _to_request(row: sqlite3.Row) -> MatchRequest:
+    return MatchRequest(
+        id=row["id"], division=row["division"], from_player=row["from_player"],
+        to_player=row["to_player"], starts_at=row["starts_at"],
+        minutes=row["minutes"], match_format=row["match_format"],
+        status=row["status"], message=row["message"],
+        tournament_match_id=row["tournament_match_id"],
+        created_at=row["created_at"], responded_at=row["responded_at"],
+    )
+
+
+def _to_tournament(row: sqlite3.Row) -> Tournament:
+    return Tournament(
+        id=row["id"], name=row["name"], division=row["division"],
+        season_id=row["season_id"], style=row["style"], seeding=row["seeding"],
+        match_format=row["match_format"], status=row["status"],
+        created_at=row["created_at"],
+    )
+
+
+def _to_tmatch(row: sqlite3.Row) -> TournamentMatch:
+    return TournamentMatch(
+        id=row["id"], tournament_id=row["tournament_id"],
+        round_no=row["round_no"], slot=row["slot"], player_a=row["player_a"],
+        player_b=row["player_b"], winner_id=row["winner_id"],
+        match_id=row["match_id"], status=row["status"],
     )
 
 
