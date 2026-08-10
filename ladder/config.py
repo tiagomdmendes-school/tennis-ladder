@@ -58,7 +58,22 @@ def apply_timezone(cfg: "Config") -> str:
         os.environ["TZ"] = cfg.timezone
         if hasattr(time, "tzset"):      # Unix only; the server is Linux
             time.tzset()
-    return time.tzname[0] if time.tzname else "UTC"
+    return current_zone_name()
+
+
+def current_zone_name() -> str:
+    """The zone abbreviation in force right now, e.g. EDT in summer.
+
+    `time.tzname` is a (standard, daylight) pair, so taking [0] unconditionally
+    labels a summer afternoon "EST" -- wrong, and the kind of small
+    inaccuracy that makes people stop trusting the times on screen.
+    """
+    if not time.tzname:
+        return "UTC"
+    in_daylight = time.daylight and time.localtime().tm_isdst > 0
+    if in_daylight and len(time.tzname) > 1 and time.tzname[1]:
+        return time.tzname[1]
+    return time.tzname[0]
 
 
 @dataclass

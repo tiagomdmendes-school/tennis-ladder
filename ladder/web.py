@@ -20,7 +20,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from . import availability as av
 from . import divisions as div
 from . import tournaments as T
-from .config import CONFIG, Config, apply_timezone
+from .config import CONFIG, Config, apply_timezone, current_zone_name
 from .mailer import KIND_HINTS, KIND_LABELS, Mailer, verify_unsubscribe
 from .scheduling import SchedulingError
 from .service import LadderService, ServiceError
@@ -216,8 +216,7 @@ class App:
 
     def clock_zone(self) -> str:
         """What timezone the times on screen are in, for saying so out loud."""
-        import time as _time
-        return self.config.timezone or (_time.tzname[0] if _time.tzname else "UTC")
+        return current_zone_name()
 
     def enabled(self) -> List[str]:
         return [d for d in div.DIVISION_ORDER if d in self.config.enabled_divisions]

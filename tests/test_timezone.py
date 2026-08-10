@@ -15,7 +15,7 @@ import time
 import unittest
 from datetime import datetime
 
-from ladder.config import Config, apply_timezone
+from ladder.config import Config, apply_timezone, current_zone_name
 
 
 class TimezoneTestCase(unittest.TestCase):
@@ -47,6 +47,13 @@ class TestApplyTimezone(TimezoneTestCase):
         self.assertIn(apply_timezone(Config(timezone="America/New_York")),
                       ("EST", "EDT"))
         self.assertEqual(apply_timezone(Config(timezone="UTC")), "UTC")
+
+    def test_the_reported_zone_follows_daylight_saving(self):
+        """time.tzname[0] is always the *standard* name, so reporting it
+        blindly labels a summer afternoon EST."""
+        apply_timezone(Config(timezone="America/New_York"))
+        expected = "EDT" if time.localtime().tm_isdst > 0 else "EST"
+        self.assertEqual(current_zone_name(), expected)
 
     def test_an_empty_setting_leaves_the_machine_alone(self):
         apply_timezone(Config(timezone="Asia/Tokyo"))
