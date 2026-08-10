@@ -165,10 +165,21 @@ button.daytoggle { background:none; border:none; padding:2px 4px; width:auto;
   color:var(--muted); font-size:12px; font-weight:600; letter-spacing:.04em;
   text-transform:uppercase; cursor:pointer; }
 button.daytoggle:hover { color:var(--ink); }
+/* Seven columns have to fit a phone without sideways scrolling, or nobody
+   fills this in on the walk to practice. */
+@media (max-width:560px) {
+  table.grid { border-spacing:1px; width:100%; }
+  table.grid td.tlabel { font-size:10px; padding-right:4px; }
+  table.grid td.slot { height:17px; }
+  button.daytoggle { font-size:10px; padding:2px 1px; letter-spacing:0; }
+}
 /* Once the script is running the boxes are redundant -- the cell is the
-   control -- so hide them but keep them in the form. */
+   control -- so hide them but keep them in the form. Size must be pinned to
+   1px: absolute positioning with width:100% resolves against the viewport
+   (there is no positioned ancestor), which made every hidden box as wide as
+   the screen and pushed the page into horizontal scroll on a phone. */
 table.grid.painting input[type=checkbox] { position:absolute; opacity:0;
-  pointer-events:none; }
+  pointer-events:none; width:1px; height:1px; margin:0; padding:0; border:0; }
 table.grid.painting td.slot { cursor:pointer; }
 table.grid.painting { user-select:none; -webkit-user-select:none; }
 
@@ -183,6 +194,33 @@ table.grid.painting { user-select:none; -webkit-user-select:none; }
   line-height:1.55; }
 .bbox a.bwin { font-weight:700; color:var(--ink); }
 .bbox a.bfind { display:block; font-size:11px; margin-top:1px; }
+
+/* Set-by-set score entry. */
+.scoregrid { display:grid; gap:8px; max-width:560px; }
+.setrow { display:grid; grid-template-columns:96px 84px 18px 84px 1fr;
+  align-items:center; gap:8px; }
+/* Names wrap rather than truncate -- "TIAGO ..." tells you nothing about
+   which column is yours, which is the one job this row has. */
+.setrow.head { align-items:end; }
+.setrow.head .sidename { font-size:11.5px; font-weight:600; color:var(--muted);
+  text-transform:uppercase; letter-spacing:.03em; text-align:center;
+  line-height:1.25; }
+.setlabel { font-size:13px; font-weight:600; }
+.setlabel .hint { display:block; margin:0; font-weight:400; }
+.scoregrid .dash { text-align:center; color:var(--muted); }
+.sbox, .tbox { text-align:center; font-variant-numeric:tabular-nums;
+  padding:9px 6px; width:100%; }
+.tbox { padding:5px 4px; font-size:13px; }
+.tbwrap { display:grid; grid-template-columns:auto 46px 12px 46px;
+  align-items:center; gap:5px; }
+.tbwrap .hint { margin:0; white-space:nowrap; }
+/* With the script running, only show a tie-break line where one happened. */
+.scoregrid.live .tbwrap { display:none; }
+.scoregrid.live .tbwrap.show { display:grid; }
+@media (max-width:560px) {
+  .setrow { grid-template-columns:80px 1fr 14px 1fr; }
+  .tbwrap { grid-column:1 / -1; justify-content:start; }
+}
 
 h3 { font-size:15px; margin:20px 0 8px; }
 """
@@ -501,6 +539,85 @@ over-perform together &mdash; which plain W&ndash;L can't tell you, because it
 doesn't know how hard the matches were.</p>"""
 
 
+# -------------------------------------------------------------- score entry
+def score_grid(side_a_label: str, side_b_label: str, *, rows: int = 3,
+               tiebreak_row: Optional[int] = None) -> str:
+    """A two-column set-by-set score entry grid.
+
+    Replaces a free-text box, which left every player inventing their own
+    format and made typos indistinguishable from unusual scorelines. Here the
+    shape of a tennis score is built into the form: a row per set, a box each
+    side of a dash, and a tie-break line that appears only when a set is 7-6.
+
+    `rows` comes from the match format, so a one-set match shows one row.
+    `tiebreak_row` marks a deciding match tie-break (played to 10) so it can be
+    labelled as such rather than looking like a wrong set score.
+    """
+    lines = []
+    for index in range(1, rows + 1):
+        is_match_tb = tiebreak_row == index
+        label = "Match tie-break" if is_match_tb else f"Set {index}"
+        hint = " to 10" if is_match_tb else ""
+        lines.append(f"""<div class="setrow" data-set="{index}">
+  <div class="setlabel">{esc(label)}<span class="hint">{hint}</span></div>
+  <input class="sbox" name="s{index}a" inputmode="numeric" maxlength="2"
+         aria-label="{esc(side_a_label)} games in set {index}">
+  <span class="dash">&ndash;</span>
+  <input class="sbox" name="s{index}b" inputmode="numeric" maxlength="2"
+         aria-label="{esc(side_b_label)} games in set {index}">
+  <div class="tbwrap" data-for="{index}">
+    <span class="hint">tie-break</span>
+    <input class="tbox" name="t{index}a" inputmode="numeric" maxlength="2"
+           aria-label="{esc(side_a_label)} tie-break points in set {index}">
+    <span class="dash">&ndash;</span>
+    <input class="tbox" name="t{index}b" inputmode="numeric" maxlength="2"
+           aria-label="{esc(side_b_label)} tie-break points in set {index}">
+  </div>
+</div>""")
+
+    return f"""<div class="scoregrid" id="scoregrid">
+  <div class="setrow head">
+    <div class="setlabel"></div>
+    <div class="sidename">{esc(side_a_label)}</div>
+    <span class="dash"></span>
+    <div class="sidename">{esc(side_b_label)}</div>
+  </div>
+  {''.join(lines)}
+</div>
+<script>{_SCORE_SCRIPT}</script>"""
+
+
+# Shows the tie-break line only when a set actually went to one. Without this
+# every row carries four boxes and the form looks far more daunting than the
+# thing it is recording.
+_SCORE_SCRIPT = """
+(function () {
+  var grid = document.getElementById('scoregrid');
+  if (!grid) return;
+  grid.classList.add('live');
+
+  function refresh(row) {
+    var a = row.querySelector('input[name^="s"][name$="a"]');
+    var b = row.querySelector('input[name^="s"][name$="b"]');
+    var wrap = row.querySelector('.tbwrap');
+    if (!a || !b || !wrap) return;
+    var x = parseInt(a.value, 10), y = parseInt(b.value, 10);
+    // A tie-break decided the set when it finished 7-6 either way.
+    var went = (x === 7 && y === 6) || (x === 6 && y === 7);
+    wrap.classList.toggle('show', went);
+    if (!went) {
+      wrap.querySelectorAll('input').forEach(function (i) { i.value = ''; });
+    }
+  }
+
+  grid.querySelectorAll('.setrow[data-set]').forEach(function (row) {
+    row.addEventListener('input', function () { refresh(row); });
+    refresh(row);
+  });
+})();
+"""
+
+
 # -------------------------------------------------------------- availability
 def availability_grid(weekly: dict, blocks: Sequence[tuple]) -> str:
     """The 'usual week' grid: drag across the times you're normally free.
@@ -691,6 +808,20 @@ def request_rows(requests: Sequence, names: dict, viewer_id: int, csrf: str,
   <button class="small" name="action" value="accept">Accept</button>
   <button class="small ghost" name="action" value="decline">Decline</button>
 </form>"""
+        elif kind == "agreed":
+            # Once it's arranged, the next thing anyone wants is to record the
+            # result -- with the opponent and format already filled in.
+            submit_url = (f"/submit?division={esc(r.division)}"
+                          f"&format={esc(r.match_format)}"
+                          f"&a1={viewer_id}&b1={r.other(viewer_id)}")
+            actions = f"""<div class="row" style="gap:6px;margin:0">
+  <a class="btn small" href="{submit_url}">Submit result</a>
+  <form method="post" action="/request/respond" style="margin:0">
+    <input type="hidden" name="csrf" value="{esc(csrf)}">
+    <input type="hidden" name="request_id" value="{r.id}">
+    <button class="small ghost" name="action" value="cancel">Cancel</button>
+  </form>
+</div>"""
         else:
             actions = f"""<form method="post" action="/request/respond" style="margin:0">
   <input type="hidden" name="csrf" value="{esc(csrf)}">

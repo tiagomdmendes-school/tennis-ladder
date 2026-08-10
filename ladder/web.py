@@ -28,7 +28,7 @@ from .storage import CONFIRMED, PENDING, Database
 from .views import (
     availability_grid, bracket_view, category_options, division_nav,
     division_options, esc, ladder_table, match_rows, page, partner_table,
-    player_options, rating_chart, request_rows, season_picker,
+    player_options, rating_chart, request_rows, score_grid, season_picker,
     standings_table, suggestion_list, today_iso, upcoming_days,
 )
 
@@ -160,6 +160,38 @@ class Response:
 
 def redirect(location: str) -> Response:
     return Response("", status=303, headers=[("Location", location)])
+
+
+def _score_from_grid(req: "Request") -> str:
+    """Turn the set-by-set boxes back into a scoreline like '6-4 7-6(5)'.
+
+    The grid is a friendlier way to type a score, not a second definition of
+    what a score means: it assembles the same text the parser has always taken,
+    so scoring.py stays the only place that decides what is valid.
+    """
+    pieces = []
+    for index in range(1, 6):
+        a, b = req.get(f"s{index}a"), req.get(f"s{index}b")
+        if not a or not b:
+            continue                      # a blank row is a set that wasn't played
+        piece = f"{a}-{b}"
+        tb_a, tb_b = req.get(f"t{index}a"), req.get(f"t{index}b")
+        if tb_a and tb_b:
+            try:
+                # Standard notation records the tie-break loser's points, which
+                # is the same number whichever side won the set.
+                piece += f"({min(int(tb_a), int(tb_b))})"
+            except ValueError:
+                pass                      # let the parser report a bad number
+        pieces.append(piece)
+
+    text = " ".join(pieces)
+    ending = req.get("ending")
+    if ending == "retired":
+        text = (text + " ret.").strip()
+    elif ending == "walkover":
+        text = (text + " w/o").strip()
+    return text
 
 
 class App:
@@ -319,7 +351,7 @@ uncertainty, so a rating has to be proven before it counts fully.
             result = app.service.submit_result(
                 division=division,
                 side_a=side_a, side_b=side_b,
-                score_text=req.get("score"),
+                score_text=req.get("score") or _score_from_grid(req),
                 played_on=req.get("played_on"),
                 submitted_by=viewer.id if viewer else None,
                 winner_side=req.get("winner_side") or None,
@@ -680,8 +712,11 @@ opponent from the ladder and you'll be shown the overlaps.</p>
                                 req.csrf, 'inbox')}</div>
 
 <h2>Agreed</h2>
-<div class="card">{request_rows(sched.scheduled(viewer.id), names, viewer.id,
-                                req.csrf, 'agreed')}</div>
+<div class="card"><p class="sub" style="margin:0 0 10px">Matches you've both
+said yes to. Played it? Submit the result straight from here &mdash; who you
+played is filled in already.</p>
+{request_rows(sched.scheduled(viewer.id), names, viewer.id,
+              req.csrf, 'agreed')}</div>
 
 <h2>You asked</h2>
 <div class="card">{request_rows(sched.outbox(viewer.id), names, viewer.id,
@@ -1635,6 +1670,43 @@ of it automatically.</p>
                     "players on the ladder first &mdash; add them in "
                     "<a href='/admin'>Admin</a>.</p>")
         division = self.current_division(req)
+        is_doubles = div.get(division).is_doubles
+
+        # Everything can arrive pre-filled: the Matches tab links here with the
+        # opponent and format already known, so submitting an arranged match is
+        # a score and a button.
+        a1 = req.get_int("a1") or (viewer.id if viewer else None)
+        a2, b1, b2 = req.get_int("a2"), req.get_int("b1"), req.get_int("b2")
+        match_format = req.get("format") or self.config.default_match_format
+        rows, tiebreak_row = self._score_shape(match_format)
+
+        def side_label(first_id, second_id, fallback):
+            """Name the column after whoever is in it.
+
+            Doubles uses first names joined -- "Tiago & Sam" says which column
+            is yours in a glance and, unlike "Tiago Mendes & partner", actually
+            names the partner. It also has to fit a phone.
+            """
+            people = []
+            for player_id in (first_id, second_id):
+                player = self.db.get_player(player_id) if player_id else None
+                if player:
+                    people.append(player.name)
+            if not people:
+                return fallback
+            if len(people) == 1:
+                return people[0] if not is_doubles else f"{people[0]} & partner"
+            return " & ".join(name.split()[0] for name in people)
+
+        side_a_label = side_label(a1, a2 if is_doubles else None, "Side A")
+        side_b_label = side_label(b1, b2 if is_doubles else None, "Side B")
+
+        formats = "".join(
+            f'<option value="{esc(key)}"'
+            f'{" selected" if key == match_format else ""}>{esc(spec["label"])}'
+            "</option>"
+            for key, spec in self.config.match_formats.items())
+
         admin_extra = ""
         if self.require_admin(req):
             admin_extra = """<div><label><input type="checkbox" name="auto_confirm"
@@ -1642,49 +1714,82 @@ of it automatically.</p>
 <div><label><input type="checkbox" name="override" value="1">
 Override category checks (admin)</label></div>"""
 
+        reload_to = f"/submit?division={division}&format=' + this.value + '"
         return f"""<h1>Submit a result</h1>
-<p class="sub">Write the score from <b>side A's</b> point of view &mdash; the
-winner is worked out from it. The result counts once someone from the other side
-confirms it.</p>
-<div class="card"><form class="stack" method="post" action="/submit">
+<p class="sub">Enter it set by set, <b>side A on the left</b>. The winner is
+worked out from the score. It counts once someone from the other side confirms
+it.</p>
+<div class="card"><form class="stack" method="post" action="/submit"
+      style="max-width:none">
 <input type="hidden" name="csrf" value="{esc(req.csrf)}">
+
+<div class="pair">
 <div><label for="division">Division</label>
-<select id="division" name="division" onchange="window.location='/submit?division='+this.value">
-{division_options(self.enabled(), division)}</select>
-<div class="hint">Changing this reloads the form with the right number of
-player slots.</div></div>
+<select id="division" name="division"
+        onchange="window.location='/submit?format={esc(match_format)}&division='+this.value">
+{division_options(self.enabled(), division)}</select></div>
+<div><label for="format">Match format</label>
+<select id="format" name="match_format"
+        onchange="window.location='{reload_to}'">{formats}</select>
+<div class="hint">Sets how many rows you get.</div></div>
+</div>
 
 <div><label>Side A</label>
 <div class="pair">
-  <select name="a1">{player_options(players, viewer.id if viewer else None)}</select>
-  {'<select name="a2">' + player_options(players, blank="-- partner --") + '</select>'
-   if div.get(division).is_doubles else ''}
+  <select name="a1">{player_options(players, a1)}</select>
+  {'<select name="a2">' + player_options(players, a2, blank="-- partner --")
+   + '</select>' if is_doubles else ''}
 </div></div>
 
 <div><label>Side B</label>
 <div class="pair">
-  <select name="b1">{player_options(players, blank="-- opponent --")}</select>
-  {'<select name="b2">' + player_options(players, blank="-- partner --") + '</select>'
-   if div.get(division).is_doubles else ''}
+  <select name="b1">{player_options(players, b1, blank="-- opponent --")}</select>
+  {'<select name="b2">' + player_options(players, b2, blank="-- partner --")
+   + '</select>' if is_doubles else ''}
 </div></div>
 
-<div><label for="score">Score</label>
-<input id="score" name="score" placeholder="6-4" required>
-<div class="hint">Side A's games first, sets separated by spaces.
-<b>A single set is fine</b> &mdash; <code>6-4</code>. So is
-<code>6-4 4-6 10-8</code> (two sets and a match tie-break),
-<code>6-4 3-6 6-2</code>, a pro set <code>8-6</code>, or Fast4 <code>4-2</code>.
-Tie-break detail is optional: <code>7-6(5)</code>. Add <code>ret.</code> for a
-retirement or <code>w/o</code> for a walkover.</div></div>
+<div><label>Score</label>
+{score_grid(side_a_label, side_b_label, rows=rows, tiebreak_row=tiebreak_row)}
+<div class="hint">Leave a row blank if the match ended sooner. A tie-break box
+appears when a set is 7-6 &mdash; put the actual points, to 5 or to 7, whichever
+you played.</div></div>
+
+<div><label for="ending">How did it end?</label>
+<select id="ending" name="ending">
+  <option value="completed">Played to a finish</option>
+  <option value="retired">Someone retired</option>
+  <option value="walkover">Walkover &mdash; nobody played</option>
+</select>
+<div class="hint">For a retirement, enter the score up to the point it stopped.
+For a walkover, say who advanced below.</div></div>
+
+<div><label for="winner_side">Who won? <span class="hint"
+     style="display:inline">only needed for a walkover</span></label>
+<select id="winner_side" name="winner_side">
+  <option value="">Work it out from the score</option>
+  <option value="a">Side A</option>
+  <option value="b">Side B</option>
+</select></div>
+
+<div class="pair">
 <div><label for="played_on">Date played</label>
 <input id="played_on" name="played_on" type="date" value="{today_iso()}"
        max="{today_iso()}"></div>
 <div><label for="note">Note (optional)</label><input id="note" name="note"
      placeholder="Challenge match, court 3"></div>
+</div>
 {admin_extra}
 <div class="row"><button type="submit">Submit result</button>
 <a class="btn ghost" href="/">Cancel</a></div>
 </form></div>"""
+
+    def _score_shape(self, match_format: str):
+        """(number of set rows, which row is a match tie-break) for a format."""
+        if match_format == "one_set":
+            return 1, None
+        if match_format == "two_sets_tb":
+            return 3, 3          # two sets then a deciding tie-break to 10
+        return 3, None           # best of three
 
 
 def make_handler(app: App):

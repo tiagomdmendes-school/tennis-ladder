@@ -22,7 +22,8 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-SET_RE = re.compile(r"^(\d{1,2})\s*[-:/]\s*(\d{1,2})(?:\s*\(\s*\d{1,2}\s*\))?$")
+SET_RE = re.compile(
+    r"^(\d{1,2})\s*[-:/]\s*(\d{1,2})(?:\s*\(\s*(\d{1,2})\s*\))?$")
 RETIRE_RE = re.compile(r"\b(ret|retired|rtd)\b\.?", re.IGNORECASE)
 WALKOVER_RE = re.compile(r"\b(w/?o|walkover|default|def)\b\.?", re.IGNORECASE)
 
@@ -34,6 +35,11 @@ class ScoreError(ValueError):
 @dataclass
 class ParsedScore:
     sets: List[Tuple[int, int]] = field(default_factory=list)
+    # Points the tie-break loser scored, per set; None where a set had no
+    # tie-break. Kept so 7-6(5) survives a round trip and still reads as a
+    # tie-break afterwards -- it says nothing to the rating, but it is the
+    # difference between "we had a close one" and a bare 7-6.
+    tiebreaks: List[Optional[int]] = field(default_factory=list)
     sets_a: int = 0
     sets_b: int = 0
     games_a: int = 0
@@ -45,8 +51,13 @@ class ParsedScore:
 
     @property
     def normalised(self) -> str:
-        """Canonical text form, e.g. '6-4 3-6 10-8 ret.'"""
-        text = " ".join(f"{a}-{b}" for a, b in self.sets)
+        """Canonical text form, e.g. '6-4 7-6(5) 10-8 ret.'"""
+        pieces = []
+        for index, (a, b) in enumerate(self.sets):
+            tiebreak = self.tiebreaks[index] if index < len(self.tiebreaks) else None
+            pieces.append(f"{a}-{b}({tiebreak})" if tiebreak is not None
+                          else f"{a}-{b}")
+        text = " ".join(pieces)
         if self.walkover:
             return (text + " w/o").strip()
         if self.retired:
@@ -74,6 +85,7 @@ def parse_score(text: str, *, match_tiebreak_in_decider: bool = True) -> ParsedS
     cleaned = WALKOVER_RE.sub(" ", RETIRE_RE.sub(" ", raw)).replace(",", " ")
 
     sets: List[Tuple[int, int]] = []
+    tiebreaks: List[Optional[int]] = []
     for token in cleaned.split():
         match = SET_RE.match(token)
         if not match:
@@ -82,11 +94,13 @@ def parse_score(text: str, *, match_tiebreak_in_decider: bool = True) -> ParsedS
                 "spaces, e.g. '6-4 3-6 10-8'."
             )
         sets.append((int(match.group(1)), int(match.group(2))))
+        tiebreaks.append(int(match.group(3)) if match.group(3) else None)
 
     if not sets and not walkover:
         raise ScoreError("Enter at least one set, for example '6-4'.")
 
-    parsed = ParsedScore(sets=sets, retired=retired, walkover=walkover)
+    parsed = ParsedScore(sets=sets, tiebreaks=tiebreaks, retired=retired,
+                         walkover=walkover)
 
     if walkover:
         # No tennis was played. Direction comes from the sets if any were given
@@ -171,7 +185,10 @@ def flip_score(text: str) -> str:
     for token in (text or "").split():
         match = SET_RE.match(token)
         if match:
-            parts.append(f"{match.group(2)}-{match.group(1)}")
+            # The bracket is the tie-break loser's points, which is the same
+            # number whichever way round the set is written.
+            tiebreak = f"({match.group(3)})" if match.group(3) else ""
+            parts.append(f"{match.group(2)}-{match.group(1)}{tiebreak}")
         else:
             parts.append(token)          # 'ret.', 'w/o' and anything unparsed
     return " ".join(parts)

@@ -17,10 +17,23 @@ class TestParsing(unittest.TestCase):
         self.assertFalse(p.a_won)
         self.assertEqual((p.games_a, p.games_b), (6, 12))
 
-    def test_tiebreak_detail_is_accepted_and_dropped(self):
+    def test_tiebreak_detail_is_kept(self):
+        """It says nothing to the rating, but it is the difference between
+        "we had a close one" and a bare 7-6, so it survives a round trip."""
         p = parse_score("7-6(5) 7-6(11)")
         self.assertEqual((p.games_a, p.games_b), (14, 12))
-        self.assertEqual(p.normalised, "7-6 7-6")
+        self.assertEqual(p.normalised, "7-6(5) 7-6(11)")
+        self.assertEqual(p.tiebreaks, [5, 11])
+
+    def test_sets_without_a_tiebreak_record_none(self):
+        p = parse_score("6-4 7-6(3)")
+        self.assertEqual(p.tiebreaks, [None, 3])
+        self.assertEqual(p.normalised, "6-4 7-6(3)")
+
+    def test_tiebreak_detail_does_not_change_the_rating_score(self):
+        plain = glicko_score(parse_score("7-6 6-4"), for_player_a=True)
+        detailed = glicko_score(parse_score("7-6(5) 6-4"), for_player_a=True)
+        self.assertEqual(plain, detailed)
 
     def test_commas_and_slashes_and_colons(self):
         for text in ("6-4, 6-4", "6:4 6:4", "6/4 6/4"):

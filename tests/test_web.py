@@ -699,6 +699,194 @@ class TestTournamentPages(WebTestCase):
         self.assertEqual(self.get("/tournament/999")[0], 404)
 
 
+class TestScoreGridSubmission(WebTestCase):
+    """The set-by-set form.
+
+    The grid is a friendlier way to type a score, not a second definition of
+    one: it assembles the same text scoring.py has always taken, so validation
+    stays in a single place.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.roster()
+        self.login_as(self.al, self.al_pin)
+
+    def submit(self, **fields):
+        payload = {"csrf": self.csrf("/submit"), "division": MS,
+                   "a1": self.al.id, "b1": self.bo.id,
+                   "played_on": days_ago(1)}
+        payload.update(fields)
+        return self.post("/submit", payload)
+
+    def stored(self):
+        matches = self.db.list_matches(limit=1)
+        return matches[0].score if matches else None
+
+    def test_straight_sets(self):
+        self.submit(s1a="6", s1b="4", s2a="6", s2b="2")
+        self.assertEqual(self.stored(), "6-4 6-2")
+
+    def test_a_single_set(self):
+        self.submit(s1a="6", s1b="4")
+        self.assertEqual(self.stored(), "6-4")
+
+    def test_blank_rows_are_ignored(self):
+        """Best-of-three won in two leaves the third row empty."""
+        self.submit(s1a="6", s1b="4", s2a="6", s2b="2", s3a="", s3b="")
+        self.assertEqual(self.stored(), "6-4 6-2")
+
+    def test_a_tiebreak_is_recorded_as_the_losers_points(self):
+        self.submit(s1a="7", s1b="6", t1a="7", t1b="5", s2a="6", s2b="3")
+        self.assertEqual(self.stored(), "7-6(5) 6-3")
+
+    def test_a_tiebreak_played_to_five_works_too(self):
+        """The club plays first-to-5 and first-to-7; both are just numbers."""
+        self.submit(s1a="7", s1b="6", t1a="5", t1b="3", s2a="6", s2b="3")
+        self.assertEqual(self.stored(), "7-6(3) 6-3")
+
+    def test_a_tiebreak_lost_records_the_losers_points_too(self):
+        self.submit(s1a="6", s1b="7", t1a="5", t1b="7", s2a="6", s2b="3",
+                    s3a="6", s3b="4")
+        self.assertEqual(self.stored(), "6-7(5) 6-3 6-4")
+
+    def test_two_sets_and_a_match_tiebreak(self):
+        self.submit(s1a="6", s1b="4", s2a="4", s2b="6", s3a="10", s3b="8")
+        self.assertEqual(self.stored(), "6-4 4-6 10-8")
+
+    def test_a_retirement(self):
+        self.submit(s1a="6", s1b="3", s2a="2", s2b="1", ending="retired")
+        match = self.db.list_matches(limit=1)[0]
+        self.assertEqual(match.score, "6-3 2-1 ret.")
+        self.assertTrue(match.retired)
+
+    def test_a_walkover_needs_a_winner(self):
+        _, body, _ = self.submit(ending="walkover")
+        self.assertTrue(self.flashes(body, "err"))
+        self.assertEqual(self.db.list_matches(), [])
+
+    def test_a_walkover_with_a_winner_is_accepted(self):
+        self.submit(ending="walkover", winner_side="a")
+        match = self.db.list_matches(limit=1)[0]
+        self.assertTrue(match.walkover)
+        self.assertEqual(match.winners, [self.al.id])
+
+    def test_an_empty_grid_is_refused(self):
+        _, body, _ = self.submit()
+        self.assertTrue(self.flashes(body, "err"))
+        self.assertEqual(self.db.list_matches(), [])
+
+    def test_a_nonsense_number_is_refused(self):
+        _, body, _ = self.submit(s1a="banana", s1b="4")
+        self.assertTrue(self.flashes(body, "err"))
+        self.assertEqual(self.db.list_matches(), [])
+
+    def test_the_grid_shows_one_row_for_a_one_set_match(self):
+        _, body, _ = self.get(f"/submit?format=one_set&division={MS}")
+        self.assertIn('name="s1a"', body)
+        self.assertNotIn('name="s2a"', body)
+
+    def test_the_grid_shows_three_rows_for_best_of_three(self):
+        _, body, _ = self.get(f"/submit?format=best_of_three&division={MS}")
+        for row in ("s1a", "s2a", "s3a"):
+            self.assertIn(f'name="{row}"', body)
+
+    def test_the_match_tiebreak_row_is_labelled(self):
+        _, body, _ = self.get(f"/submit?format=two_sets_tb&division={MS}")
+        self.assertIn("Match tie-break", body)
+
+    def test_the_column_headers_name_the_players(self):
+        _, body, _ = self.get(
+            f"/submit?division={MS}&a1={self.al.id}&b1={self.bo.id}")
+        self.assertIn("Al", body)
+        self.assertIn("Bo", body)
+
+
+class TestMobileLayout(WebTestCase):
+    """Guards against the page scrolling sideways on a phone.
+
+    These check the CSS rules that caused a real overflow rather than
+    rendering: the hidden availability checkboxes kept `width:100%` while
+    absolutely positioned, which with no positioned ancestor resolves against
+    the viewport -- every hidden box became as wide as the screen and pushed
+    the document to nearly twice the phone's width.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.roster()
+        self.login_as(self.al, self.al_pin)
+
+    def test_hidden_availability_checkboxes_have_no_size(self):
+        _, body, _ = self.get("/availability")
+        rule = re.search(
+            r"table\.grid\.painting input\[type=checkbox\]\s*\{([^}]*)\}", body)
+        self.assertIsNotNone(rule, "the hide-checkboxes rule went missing")
+        declarations = rule.group(1)
+        self.assertIn("position:absolute", declarations)
+        self.assertIn("width:1px", declarations)
+        self.assertIn("height:1px", declarations)
+
+    def test_the_layout_has_a_phone_breakpoint(self):
+        _, body, _ = self.get("/availability")
+        self.assertIn("@media (max-width:560px)", body)
+
+    def test_wide_content_is_wrapped_so_it_scrolls_inside_its_own_box(self):
+        """Tables and brackets are allowed to be wider than a phone, but only
+        inside a scroll container -- never by widening the page."""
+        for path in ("/", "/matches", "/availability"):
+            _, body, _ = self.get(path)
+            for table_start in re.finditer(r"<table", body):
+                before = body[:table_start.start()]
+                self.assertIn('class="scroll"', before[-400:], path)
+
+    def test_doubles_columns_name_both_players_compactly(self):
+        _, body, _ = self.get(
+            f"/submit?division={MD}&a1={self.al.id}&a2={self.bo.id}"
+            f"&b1={self.cy.id}&b2={self.dan.id}")
+        self.assertIn("Al &amp; Bo", body)
+        self.assertIn("Cy &amp; Dan", body)
+        self.assertNotIn("&amp; partner", body)
+
+    def test_a_half_filled_doubles_side_still_reads_sensibly(self):
+        _, body, _ = self.get(f"/submit?division={MD}&a1={self.al.id}")
+        self.assertIn("Al &amp; partner", body)
+
+
+class TestSubmitFromMatchesTab(WebTestCase):
+    def setUp(self):
+        super().setUp()
+        self.roster()
+        self.login_as(self.al, self.al_pin)
+        when = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%dT%H:%M")
+        request = self.app.service.scheduler.request_match(
+            division=MS, from_player=self.al.id, to_player=self.bo.id,
+            starts_at=when)
+        self.app.service.scheduler.respond(request.id, self.bo.id, True)
+
+    def test_an_agreed_match_offers_a_submit_link(self):
+        _, body, _ = self.get("/schedule")
+        self.assertIn("Submit result", body)
+        self.assertIn(f"a1={self.al.id}", body)
+        self.assertIn(f"b1={self.bo.id}", body)
+
+    def test_the_link_prefills_both_players(self):
+        _, body, _ = self.get(
+            f"/submit?division={MS}&format=one_set"
+            f"&a1={self.al.id}&b1={self.bo.id}")
+        self.assertIn(f'<option value="{self.al.id}" selected>', body)
+        self.assertIn(f'<option value="{self.bo.id}" selected>', body)
+
+    def test_submitting_closes_the_arranged_match(self):
+        self.post("/submit", {"csrf": self.csrf("/submit"), "division": MS,
+                              "a1": self.al.id, "b1": self.bo.id,
+                              "s1a": "6", "s1b": "4",
+                              "played_on": days_ago(0)})
+        match = self.db.list_matches(limit=1)[0]
+        self.app.service.confirm(match.id, self.bo.id)
+        self.assertEqual(self.app.service.scheduler.scheduled(self.al.id), [])
+
+
 class TestHardDeletes(WebTestCase):
     """Permanent deletion, for clearing out test data.
 
