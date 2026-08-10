@@ -361,6 +361,25 @@ class LadderService:
                             "winner_games": won, "loser_games": lost})
         return tournaments.standings(entrants, results)
 
+    def pending_tournament_match(self, player_a: int, player_b: int):
+        """A live tournament match between these two, if there is one.
+
+        Returns (tournament, tournament_match, round) or None. Used so that
+        arranging a match knows about its round deadline -- suggesting a time
+        after the cut-off is worse than useless.
+        """
+        for tournament in self.db.list_tournaments():
+            if tournament.status != "running":
+                continue
+            for tmatch in self.db.tournament_matches(tournament.id):
+                if (tmatch.winner_id is None and tmatch.is_ready
+                        and {player_a, player_b} == set(tmatch.players)):
+                    round_info = next(
+                        (r for r in self.db.rounds(tournament.id)
+                         if r.round_no == tmatch.round_no), None)
+                    return tournament, tmatch, round_info
+        return None
+
     def overdue_matches(self, tournament_id: int) -> List:
         """Matches whose round deadline has passed and still aren't played."""
         deadlines = {r.round_no: r for r in self.db.rounds(tournament_id)}

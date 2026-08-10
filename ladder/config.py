@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import time
 from dataclasses import asdict, dataclass, field, fields
 from typing import Dict, List
 
@@ -37,10 +38,38 @@ def set_data_dir(path: str) -> None:
     CONFIG_PATH = data_path("config.json")
 
 
+def apply_timezone(cfg: "Config") -> str:
+    """Put the whole process into the club's timezone.
+
+    Every datetime in this app is naive and taken from the machine's clock. On
+    a cloud server that clock is UTC, while the people using the app think in
+    local time -- so "3pm" in the availability grid silently means 11am to
+    anyone on US Eastern, and a suggested time can appear to be in the future
+    while the server considers it past.
+
+    Setting TZ and calling tzset moves the process itself, so `datetime.now()`
+    and every stored time are club-local with no conversion code anywhere. It
+    is stdlib-only and handles daylight saving through the system tz database,
+    which matters: a fixed offset would be an hour wrong for half the year.
+
+    Returns the timezone actually in effect, for the startup banner.
+    """
+    if cfg.timezone:
+        os.environ["TZ"] = cfg.timezone
+        if hasattr(time, "tzset"):      # Unix only; the server is Linux
+            time.tzset()
+    return time.tzname[0] if time.tzname else "UTC"
+
+
 @dataclass
 class Config:
     # --- club identity -------------------------------------------------
     club_name: str = "Tennis Ladder"
+    # The club's local timezone, e.g. "America/New_York". Everything shown and
+    # stored uses it. Left empty the app follows the machine's own setting --
+    # which on a cloud server is almost always UTC, and almost never what you
+    # want. `timedatectl list-timezones` lists the valid names.
+    timezone: str = ""
 
     # --- Glicko-2 rating system ----------------------------------------
     initial_rating: float = 1500.0

@@ -7,7 +7,7 @@ time both people have agreed to.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional, Sequence
 
 from .availability import Slot, mutual_slots
@@ -16,6 +16,12 @@ from .storage import (
     REQUEST_ACCEPTED, REQUEST_CANCELLED, REQUEST_DECLINED, REQUEST_PENDING,
     REQUEST_PLAYED, Database, MatchRequest,
 )
+
+
+# How far into the past a proposed time may be before it's refused. This is a
+# guard against typos ("2025" instead of "2026"), not a stopwatch: a suggestion
+# rendered a minute ago is still a perfectly sensible thing to click.
+PROPOSAL_GRACE_MINUTES = 15
 
 
 class SchedulingError(Exception):
@@ -80,7 +86,7 @@ class Scheduler:
             raise SchedulingError("That player isn't on the ladder.")
 
         when = self._parse_when(starts_at)
-        if when < datetime.now():
+        if when < datetime.now() - timedelta(minutes=PROPOSAL_GRACE_MINUTES):
             raise SchedulingError("That time has already passed.")
 
         match_format = match_format or self.config.default_match_format

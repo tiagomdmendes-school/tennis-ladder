@@ -204,12 +204,25 @@ def mutual_slots(
     return found
 
 
+# Suggested start times are rounded up to a multiple of this, so a window that
+# is already underway becomes a clean, proposable time.
+SUGGESTION_GRANULARITY = 15
+
+
 def _shift_into_future(slot: Slot, earliest: datetime, minutes: int) -> Optional[Slot]:
-    """Trim a window that has already started, if enough of it is left."""
-    minutes_now = earliest.hour * 60 + earliest.minute
+    """Trim a window that has already started, if enough of it is left.
+
+    The start is rounded *up* to the next quarter hour rather than set to the
+    current minute. Two reasons: "2:29pm" is not a time anyone arranges to meet
+    at, and more importantly a suggestion of exactly-now is stale the instant
+    it's rendered -- by the time someone clicks it, it is in the past and gets
+    rejected.
+    """
     if earliest.date() != slot.on:
         return None
+    minutes_now = earliest.hour * 60 + earliest.minute
     start = max(slot.start, minutes_now)
+    start = -(-start // SUGGESTION_GRANULARITY) * SUGGESTION_GRANULARITY
     if slot.end - start < minutes:
         return None
     return Slot(slot.on, start, slot.end)

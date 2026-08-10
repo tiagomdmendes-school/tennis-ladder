@@ -12,7 +12,7 @@ import json
 import re
 import secrets
 import urllib.parse
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, List, Optional, Tuple
@@ -20,7 +20,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from . import availability as av
 from . import divisions as div
 from . import tournaments as T
-from .config import CONFIG, Config
+from .config import CONFIG, Config, apply_timezone
 from .mailer import KIND_HINTS, KIND_LABELS, Mailer, verify_unsubscribe
 from .scheduling import SchedulingError
 from .service import LadderService, ServiceError
@@ -213,6 +213,11 @@ class App:
 
     def require_admin(self, req: Request) -> bool:
         return bool(req.session.get("is_admin"))
+
+    def clock_zone(self) -> str:
+        """What timezone the times on screen are in, for saying so out loud."""
+        import time as _time
+        return self.config.timezone or (_time.tzname[0] if _time.tzname else "UTC")
 
     def enabled(self) -> List[str]:
         return [d for d in div.DIVISION_ORDER if d in self.config.enabled_divisions]
@@ -605,7 +610,8 @@ are unchanged &mdash; adjust them any time in
 <p class="sub">Set your usual week once. It's used to suggest times you and an
 opponent are both free, so matches can happen outside practice. Rough is fine
 &mdash; you confirm an actual time with the other player before anything is
-booked.</p>
+booked. All times are {esc(app.clock_zone())}, and it's currently
+<b>{datetime.now():%-I:%M%p}</b> there.</p>
 
 <div class="card"><h2 style="margin-top:0">Your usual week</h2>
 <p class="sub">Currently: <b>{esc(av.describe_week(mine.weekly))}</b></p>
@@ -756,7 +762,31 @@ both free.</p>
             division = app.current_division(req)
             match_format = req.get("format") or app.config.default_match_format
             sched = app.service.scheduler
-            slots = sched.suggest(viewer.id, opponent.id, match_format=match_format)
+
+            # If this pair owe each other a tournament match, the round's
+            # play-by date bounds the whole page: no point suggesting a time
+            # after the cut-off, and the deadline should be impossible to miss.
+            fixture = app.service.pending_tournament_match(viewer.id, opponent.id)
+            deadline = None
+            tournament_note = ""
+            if fixture:
+                tournament, _, round_info = fixture
+                deadline = round_info.deadline if round_info else None
+                match_format = tournament.match_format
+                division = tournament.division
+                tournament_note = (
+                    f'<div class="flash warn"><b>{esc(tournament.name)} &mdash; '
+                    f'{esc(round_info.name if round_info else "this round")}.</b> '
+                    + (f'This match needs to be played by <b>{esc(deadline)}</b>, '
+                       'so only times before then are shown.'
+                       if deadline else
+                       'Arrange it between yourselves and submit the result as '
+                       'normal.')
+                    + f' <a href="/tournament/{tournament.id}">See the draw</a>.'
+                    "</div>")
+
+            slots = sched.suggest(viewer.id, opponent.id,
+                                  match_format=match_format, not_after=deadline)
 
             missing = []
             if not sched.has_availability(viewer.id):
@@ -774,9 +804,19 @@ both free.</p>
                 f'{esc(spec["label"])} (~{spec["minutes"]} min)</option>'
                 for key, spec in app.config.match_formats.items())
 
-            body = f"""{warn}<h1>Play {esc(opponent.name)}</h1>
+            no_slots_note = ""
+            if deadline and not slots and not missing:
+                no_slots_note = (
+                    '<div class="flash err">You have no shared free time before '
+                    f'<b>{esc(deadline)}</b>. Either add availability, propose a '
+                    'time below and sort it out between you, or ask the ladder '
+                    'admin to extend the round.</div>')
+
+            body = f"""{warn}{tournament_note}{no_slots_note}
+<h1>Play {esc(opponent.name)}</h1>
 <p class="sub">Times you're both free for a
-<b>{esc(app.service.scheduler.format_label(match_format))}</b>, soonest first.
+<b>{esc(app.service.scheduler.format_label(match_format))}</b>, soonest first{
+', ending by ' + esc(deadline) if deadline else ''}.
 Picking one sends {esc(opponent.name)} a request &mdash; nothing is booked
 until they accept.</p>
 
@@ -1697,6 +1737,7 @@ def make_handler(app: App):
 def serve(host: str = "0.0.0.0", port: int = 8000,
           db_path: Optional[str] = None, config: Optional[Config] = None) -> None:
     config = config or CONFIG
+    zone = apply_timezone(config)
     db = Database(db_path) if db_path else Database()
     db.purge_sessions()
     app = App(db, config)
@@ -1706,6 +1747,11 @@ def serve(host: str = "0.0.0.0", port: int = 8000,
     # and the admin-password warning is the one thing you must not miss.
     print(f"\n  {config.club_name}", flush=True)
     print(f"  http://{shown}:{port}\n", flush=True)
+    print(f"  clock: {datetime.now():%Y-%m-%d %H:%M} {zone}", flush=True)
+    if not config.timezone:
+        print("  ! no timezone set -- using the machine's own, which on a "
+              "server is usually UTC.\n    Set \"timezone\" in config.json "
+              "(e.g. America/New_York) or every time will be wrong.", flush=True)
     if config.admin_password == "changeme":
         print("  ! Admin password is still 'changeme' -- set admin_password in"
               " your config.json\n", flush=True)

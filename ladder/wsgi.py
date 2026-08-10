@@ -16,7 +16,7 @@ from __future__ import annotations
 import io
 from typing import Callable, Iterable, List, Optional, Tuple
 
-from .config import CONFIG, Config
+from .config import CONFIG, Config, apply_timezone
 from .storage import Database
 from .web import COOKIE_NAME, App, Request
 
@@ -63,6 +63,7 @@ class Application:
     def __init__(self, db: Optional[Database] = None,
                  config: Optional[Config] = None):
         self.config = config or CONFIG
+        apply_timezone(self.config)     # before any datetime is taken
         self.db = db or Database()
         self.db.purge_sessions()
         self.app = App(self.db, self.config)
