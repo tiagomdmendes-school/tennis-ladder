@@ -5,7 +5,7 @@ opponent confirms, and five ladders update themselves — men's and women's
 singles and doubles, plus mixed. Ratings use **Glicko-2**, so the standings
 reflect *who* you beat, and in doubles, *who you had to carry*.
 
-No dependencies, no build step, no accounts to sign up for. Python 3.10+ and one
+No dependencies, no build step, no accounts to sign up for. Python 3.8+ and one
 command.
 
 ```bash
@@ -395,7 +395,20 @@ Copy that one file and you have a complete backup.
 python3 -m unittest discover -s tests -t .
 ```
 
-369 tests, no dependencies. The ones worth knowing about:
+376 tests, no dependencies.
+
+**Run them on the Python your server actually has.** The deployed box runs 3.8
+(Ubuntu 20.04); development happens on 3.13. A backslash inside an f-string
+expression is valid on 3.12+ and a `SyntaxError` before it — that difference
+once shipped and took the server down. `tests/test_compatibility.py` now guards
+the constructs that differ, but the real check is running the suite against the
+target version:
+
+```bash
+python3.8 -m unittest discover -s tests -t .
+```
+
+The ones worth knowing about:
 
 - **`test_availability.py`** pins the interval arithmetic underneath the
   scheduler: merging, subtracting a blocked afternoon, intersecting two weeks,

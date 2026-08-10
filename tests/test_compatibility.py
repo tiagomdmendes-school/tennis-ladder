@@ -1,7 +1,8 @@
 """Guard against syntax that only works on newer Pythons than we support.
 
-The app claims Python 3.10+, which matters because Ubuntu 22.04 LTS -- the most
-likely thing a club's server is running -- ships 3.10.
+The floor is Python 3.8, because that is what Ubuntu 20.04 ships and what the
+club's Oracle Cloud box actually runs. The suite is run against 3.8, 3.10 and
+3.13; the version on the server is the one that counts.
 
 This exists because a real bug shipped: an f-string with a backslash in its
 expression part, which PEP 701 made legal in 3.12 but is a SyntaxError before
@@ -19,7 +20,7 @@ import re
 import unittest
 
 PROJECT = pathlib.Path(__file__).resolve().parent.parent
-MIN_VERSION = (3, 10)
+MIN_VERSION = (3, 8)
 
 # An f-string prefix: f, rf, fr, Rf, ... immediately before a quote.
 FSTRING_PREFIX = re.compile(r"""(?<![\w'"])([fF][rR]?|[rR][fF])(['"])""")
@@ -58,7 +59,7 @@ def expression_parts(line: str):
 
 class TestNoPost310Syntax(unittest.TestCase):
     def test_no_backslash_inside_an_fstring_expression(self):
-        """Legal from 3.12 (PEP 701), a SyntaxError on 3.10 and 3.11."""
+        """Legal from 3.12 (PEP 701), a SyntaxError on everything before it."""
         offenders = []
         for path in python_files():
             for number, line in enumerate(path.read_text().splitlines(), start=1):
