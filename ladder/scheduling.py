@@ -8,7 +8,7 @@ time both people have agreed to.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 from .availability import Slot, mutual_slots
 from .config import Config
@@ -29,9 +29,22 @@ class SchedulingError(Exception):
 
 
 class Scheduler:
-    def __init__(self, db: Database, config: Config):
+    def __init__(self, db: Database, config: Config,
+                 notifier: Optional[Callable] = None):
         self.db = db
         self.config = config
+        # Called as notifier(event, **context). Injected so scheduling never
+        # depends on email being configured, or working.
+        self.notifier = notifier
+
+    def _notify(self, event: str, **context) -> None:
+        if not self.notifier:
+            return
+        try:
+            self.notifier(event, **context)
+        except Exception:                    # noqa: BLE001
+            # Telling someone about a request must never stop it being made.
+            pass
 
     # ----------------------------------------------------------- match length
     def format_minutes(self, match_format: str) -> int:
@@ -109,7 +122,9 @@ class Scheduler:
             match_format=match_format, message=message,
             tournament_match_id=tournament_match_id,
         )
-        return self.db.get_match_request(request_id)      # type: ignore[return-value]
+        request = self.db.get_match_request(request_id)
+        self._notify("match_requested", request=request)
+        return request                                    # type: ignore[return-value]
 
     def respond(self, request_id: int, player_id: int, accept: bool) -> MatchRequest:
         request = self.db.get_match_request(request_id)
@@ -129,7 +144,9 @@ class Scheduler:
                 if other.id != request_id and other.other(player_id) in (
                         request.from_player, request.to_player):
                     self.db.set_request_status(other.id, REQUEST_CANCELLED)
-        return self.db.get_match_request(request_id)      # type: ignore[return-value]
+        answered = self.db.get_match_request(request_id)
+        self._notify("request_answered", request=answered, accepted=accept)
+        return answered                                   # type: ignore[return-value]
 
     def cancel(self, request_id: int, player_id: int) -> None:
         request = self.db.get_match_request(request_id)

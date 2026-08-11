@@ -33,8 +33,10 @@ CONFIRM = "confirm"
 RESULT = "result"
 WEEKLY = "weekly"
 SEASON = "season"
+REQUEST = "request"
 
 KIND_LABELS = {
+    REQUEST: "Someone asks me for a match, or answers my request",
     CONFIRM: "A result needs my confirmation",
     RESULT: "My submitted result was confirmed or disputed",
     WEEKLY: "Weekly ladder summary",
@@ -42,6 +44,9 @@ KIND_LABELS = {
 }
 
 KIND_HINTS = {
+    REQUEST: "How you find out someone wants to play. Without it a request "
+             "sits unseen until you happen to open the site, which is usually "
+             "after the time has passed.",
     CONFIRM: "The one that keeps the ladder moving -- without it, results sit "
              "unconfirmed until someone happens to check the site.",
     RESULT: "Closes the loop after you submit: your rating moved, or there's a "
@@ -123,6 +128,8 @@ class Mailer:
             "result_confirmed": self._result_settled,
             "result_disputed": self._result_settled,
             "season_started": self._season_started,
+            "match_requested": self._match_requested,
+            "request_answered": self._request_answered,
         }.get(event)
         if handler:
             handler(event=event, **context)
@@ -214,6 +221,48 @@ class Mailer:
                                  action="See where you stand:",
                                  path=f"/player/{player_id}"),
             )
+
+    def _match_requested(self, *, request, event: str = "") -> None:
+        """Someone wants to play you at a specific time."""
+        player = self.db.get_player(request.to_player)
+        if not player or not player.wants(REQUEST):
+            return
+        names = self._names()
+        asker = names.get(request.from_player, "Someone")
+        when = request.when.strftime("%A %d %B at %-I:%M%p").replace(":00", "")
+        body = (
+            f"{asker} has asked you for a match.\n\n"
+            f"  {div.get(request.division).label}\n"
+            f"  {when}\n"
+            f"  about {request.minutes} minutes\n"
+            + (f"  \"{request.message}\"\n" if request.message else "")
+            + "\nNothing is booked until you accept.\n"
+            + self._link("Accept or decline:", "/schedule")
+        )
+        self._queue_message(player, REQUEST,
+                            f"{asker} wants to play you", body)
+
+    def _request_answered(self, *, request, accepted: bool,
+                          event: str = "") -> None:
+        """Your request was accepted or declined -- closes the loop."""
+        player = self.db.get_player(request.from_player)
+        if not player or not player.wants(REQUEST):
+            return
+        names = self._names()
+        other = names.get(request.to_player, "They")
+        when = request.when.strftime("%A %d %B at %-I:%M%p").replace(":00", "")
+        if accepted:
+            body = (f"{other} accepted. You're playing {when}.\n\n"
+                    "Play it, then submit the score -- there's a button on the\n"
+                    "Matches page with the details already filled in.\n"
+                    + self._link("Your matches:", "/schedule"))
+            subject = f"{other} accepted -- {when}"
+        else:
+            body = (f"{other} can't make {when}.\n\n"
+                    "Try another time, or check when you're both free.\n"
+                    + self._link("Find a time:", "/schedule"))
+            subject = f"{other} declined {when}"
+        self._queue_message(player, REQUEST, subject, body)
 
     def _season_started(self, *, season: Season, event: str = "") -> None:
         for player in self.db.list_players(active_only=True):

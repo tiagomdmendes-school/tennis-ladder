@@ -40,7 +40,7 @@ class LadderService:
         self.db = db
         self.config = config
         self.engine = LadderEngine(db, config)
-        self.scheduler = Scheduler(db, config)
+        self.scheduler = Scheduler(db, config, notifier=notifier)
         # Called as notifier(event, **context). Injected so the service never
         # depends on email being configured, or working.
         self.notifier = notifier

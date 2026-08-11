@@ -17,7 +17,7 @@ import sqlite3
 from datetime import date
 from typing import Callable, List
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Divisions can't be inferred for matches recorded before divisions existed --
 # every one of them was singles, but nothing recorded which category. They go
@@ -70,7 +70,8 @@ CREATE TABLE IF NOT EXISTS players (
     notify_confirm  INTEGER NOT NULL DEFAULT 1,
     notify_result   INTEGER NOT NULL DEFAULT 1,
     notify_weekly   INTEGER NOT NULL DEFAULT 0,
-    notify_season   INTEGER NOT NULL DEFAULT 1
+    notify_season   INTEGER NOT NULL DEFAULT 1,
+    notify_request  INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS matches (
@@ -278,9 +279,21 @@ def _migrate_v0_to_v1(conn: sqlite3.Connection) -> None:
         conn.execute("DROP TABLE matches_v0")
 
 
+def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    """Add the match-request notification toggle.
+
+    Defaults on: being asked for a match is the thing you most need to hear
+    about, since otherwise you only find out by happening to open the site.
+    """
+    if "notify_request" not in _columns(conn, "players"):
+        conn.execute("ALTER TABLE players ADD COLUMN notify_request"
+                     " INTEGER NOT NULL DEFAULT 1")
+
+
 MIGRATIONS: List[Callable[[sqlite3.Connection], None]] = [
     _migrate_v0_to_v1,      # index 0 upgrades version 0 -> 1
     _migrate_v1_to_v2,      # index 1 upgrades version 1 -> 2
+    _migrate_v2_to_v3,      # index 2 upgrades version 2 -> 3
 ]
 
 

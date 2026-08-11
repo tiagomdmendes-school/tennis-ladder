@@ -139,6 +139,13 @@ class TestV0Upgrade(unittest.TestCase):
         for match in self.db.list_matches():
             self.assertEqual(match.season_id, seasons[0].id)
 
+    def test_the_request_notification_defaults_on_for_existing_players(self):
+        """A column added later must not arrive switched off for everyone who
+        was already on the ladder -- they'd never hear about a match request
+        and would reasonably assume the feature was broken."""
+        for player in self.db.list_players():
+            self.assertTrue(player.notify_request, player.name)
+
     def test_migrating_twice_is_harmless(self):
         again = Database(self.path)
         self.addCleanup(again.close)

@@ -80,6 +80,7 @@ class Player:
     notify_result: bool = True
     notify_weekly: bool = False
     notify_season: bool = True
+    notify_request: bool = True
 
     def wants(self, kind: str) -> bool:
         """Whether this player opted in to a notification type."""
@@ -463,7 +464,7 @@ class Database:
         self._touch()
 
     def set_notification(self, player_id: int, kind: str, on: bool) -> None:
-        if kind not in ("confirm", "result", "weekly", "season"):
+        if kind not in ("confirm", "result", "weekly", "season", "request"):
             raise ValueError(f"Unknown notification type {kind!r}.")
         with self.connect() as conn:
             conn.execute(
@@ -1062,6 +1063,7 @@ def _to_player(row: sqlite3.Row) -> Player:
         notify_result=bool(row["notify_result"]),
         notify_weekly=bool(row["notify_weekly"]),
         notify_season=bool(row["notify_season"]),
+        notify_request=bool(row["notify_request"]),
     )
 
 

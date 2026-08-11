@@ -5,6 +5,7 @@ they opted into, and a broken mail server never breaks the ladder.
 """
 
 import unittest
+from datetime import datetime, timedelta
 
 from ladder import divisions as div
 from ladder.mailer import KIND_LABELS, Mailer, unsubscribe_token, verify_unsubscribe
@@ -91,6 +92,72 @@ class TestConfirmationEmails(MailerTestCase):
         self.assertIn("Al", body)
         self.assertIn("6-4 6-4", body)
         self.assertIn("https://ladder.example.edu/pending", body)
+
+
+class TestMatchRequestEmails(MailerTestCase):
+    """Being asked for a match is the notification the scheduling feature
+    depends on: without it a request sits unseen until someone happens to open
+    the site, which is usually after the proposed time has passed."""
+
+    def soon(self, hours=48):
+        return (datetime.now() + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M")
+
+    def ask(self, message=""):
+        request = self.service.scheduler.request_match(
+            division=MS, from_player=self.al.id, to_player=self.bo.id,
+            starts_at=self.soon(), message=message)
+        self.mailer.flush()
+        return request
+
+    def test_the_person_asked_is_emailed(self):
+        self.ask()
+        self.assertEqual(self.recipients(), ["bo@example.edu"])
+        self.assertIn("wants to play you", self.outbox[0]["Subject"])
+
+    def test_the_asker_is_not_emailed_their_own_request(self):
+        self.ask()
+        self.assertNotIn("al@example.edu", self.recipients())
+
+    def test_the_email_carries_the_time_and_the_message(self):
+        self.ask(message="courts free after 4")
+        body = self.outbox[0].get_content()
+        self.assertIn("courts free after 4", body)
+        self.assertIn("Men's Singles", body)
+        self.assertIn("/schedule", body)
+
+    def test_accepting_tells_the_asker(self):
+        request = self.ask()
+        self.outbox.clear()
+        self.service.scheduler.respond(request.id, self.bo.id, True)
+        self.mailer.flush()
+        self.assertEqual(self.recipients(), ["al@example.edu"])
+        self.assertIn("accepted", self.outbox[0]["Subject"])
+
+    def test_declining_tells_the_asker_too(self):
+        request = self.ask()
+        self.outbox.clear()
+        self.service.scheduler.respond(request.id, self.bo.id, False)
+        self.mailer.flush()
+        self.assertEqual(self.recipients(), ["al@example.edu"])
+        self.assertIn("declined", self.outbox[0]["Subject"])
+
+    def test_opting_out_silences_it(self):
+        self.db.set_notification(self.bo.id, "request", False)
+        self.ask()
+        self.assertEqual(self.outbox, [])
+
+    def test_it_is_on_by_default(self):
+        """Defaulting off would make the feature look broken to a new club."""
+        fresh = self.db.add_player("Newbie", "new@example.edu", category=div.MENS)
+        self.assertTrue(fresh.notify_request)
+
+    def test_a_broken_mail_server_does_not_stop_the_request(self):
+        def explode(message):
+            raise OSError("connection refused")
+
+        self.mailer._sender = explode
+        request = self.ask()
+        self.assertEqual(self.db.get_match_request(request.id).status, "pending")
 
 
 class TestOptIn(MailerTestCase):
@@ -195,7 +262,11 @@ class TestUnsubscribeTokens(unittest.TestCase):
 
     def test_every_notification_kind_is_covered(self):
         self.assertEqual(set(KIND_LABELS),
-                         {"confirm", "result", "weekly", "season"})
+                         {"request", "confirm", "result", "weekly", "season"})
+
+    def test_every_kind_has_a_hint_explaining_it(self):
+        from ladder.mailer import KIND_HINTS
+        self.assertEqual(set(KIND_HINTS), set(KIND_LABELS))
 
 
 class TestFailuresAreContained(unittest.TestCase):

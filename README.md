@@ -195,10 +195,11 @@ Off until an admin configures SMTP (stdlib `smtplib`, still zero dependencies).
 Each player then picks **which** notifications they want, individually, on their
 own `/me` settings page:
 
-1. A result needs your confirmation
-2. Your submitted result was confirmed or disputed
-3. Weekly ladder summary
-4. New season started
+1. **Someone asks you for a match**, or answers a request you sent
+2. A result needs your confirmation
+3. Your submitted result was confirmed or disputed
+4. Weekly ladder summary
+5. New season started
 
 Nothing is sent to anyone who hasn't opted in, and every message carries a
 working one-click unsubscribe link for its own type. Sending happens on a
@@ -375,7 +376,7 @@ ladder/
   web.py / views.py  router, HTML, and the rating charts
   wsgi.py            entry point for gunicorn / PythonAnywhere
 tools/               seed_demo.py, ladderctl.py
-tests/               426 tests
+tests/               436 tests
 data/                ladder.db and config.json (created on first run)
 ```
 
@@ -395,7 +396,7 @@ Copy that one file and you have a complete backup.
 python3 -m unittest discover -s tests -t .
 ```
 
-426 tests, no dependencies.
+436 tests, no dependencies.
 
 **Run them on the Python your server actually has.** The deployed box runs 3.8
 (Ubuntu 20.04); development happens on 3.13. A backslash inside an f-string
