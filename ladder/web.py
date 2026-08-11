@@ -1290,6 +1290,31 @@ new one.</p>
                 f'{" selected" if k == app.config.default_match_format else ""}>'
                 f'{esc(spec["label"])} (~{spec["minutes"]} min)</option>'
                 for k, spec in app.config.match_formats.items())
+            if app.config.email_enabled:
+                opted_in = sum(1 for p in players
+                               if p.active and any(p.wants(k) for k in KIND_LABELS))
+                email_status = f"""<p class="sub">Sending through
+<b>{esc(app.config.smtp_host)}:{app.config.smtp_port}</b> as
+<b>{esc(app.config.smtp_from)}</b>. {opted_in} player(s) have opted in to at
+least one notification.</p>
+<form method="post" action="/admin/email-test" class="row" style="margin:0">
+  <input type="hidden" name="csrf" value="{esc(req.csrf)}">
+  <input name="to" type="email" placeholder="you@example.com"
+         style="width:auto;min-width:220px" required>
+  <button class="small">Send a test email</button>
+</form>
+<p class="hint">The result is reported here, including the mail server's own
+error if it fails &mdash; which is the quickest way to tell a wrong password
+from a blocked port.</p>"""
+            else:
+                email_status = """<p class="sub">Not configured, so nothing is
+sent and the notification toggles are hidden from players.</p>
+<p class="sub">Add <code>smtp_host</code>, <code>smtp_user</code>,
+<code>smtp_password</code> and <code>smtp_from</code> to
+<code>config.json</code>, then restart. Any provider that accepts SMTP on port
+587 works; a free Brevo account gives you credentials without needing a domain.
+Set <code>base_url</code> too, or links in the emails point nowhere.</p>"""
+
             entrant_boxes = "".join(
                 f'<label style="font-weight:400;display:block;margin-bottom:4px">'
                 f'<input type="checkbox" name="entrant" value="{p.id}">'
@@ -1390,6 +1415,9 @@ there for clearing out test data. For a real player who has left, use
   <div class="row"><button type="submit">Create tournament</button></div>
 </form></div>
 
+<div class="card"><h2 style="margin-top:0">Email</h2>
+{email_status}</div>
+
 <div class="card"><h2 style="margin-top:0">Import results (CSV)</h2>
 <form class="stack" method="post" action="/admin/import" enctype="multipart/form-data"
       style="max-width:none">
@@ -1466,6 +1494,15 @@ pick a new one.</p>
                                 f"{'es' if removed['matches'] != 1 else ''} and "
                                 f"{removed['requests']} request"
                                 f"{'s' if removed['requests'] != 1 else ''}.")
+            return redirect("/admin")
+
+        @self.route("POST", "/admin/email-test")
+        def admin_email_test(req: Request) -> Response:
+            if not app.require_admin(req) or not req.check_csrf():
+                req.flash("err", "Admin access required.")
+                return redirect("/login")
+            outcome = app.mailer.send_test(req.get("to"))
+            req.flash("ok" if outcome.startswith("Sent") else "err", esc(outcome))
             return redirect("/admin")
 
         @self.route("POST", "/admin/season")

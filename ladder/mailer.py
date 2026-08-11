@@ -127,6 +127,36 @@ class Mailer:
         if handler:
             handler(event=event, **context)
 
+    def send_test(self, to_address: str) -> str:
+        """Send one email right now and report what happened, in words.
+
+        Deliberately synchronous and deliberately not swallowing errors: the
+        whole point is to see the SMTP server's actual complaint while setting
+        this up, rather than watching nothing arrive and having to guess.
+        """
+        if not self.config.email_enabled:
+            return ("Email isn't configured yet -- set smtp_host and smtp_from "
+                    "in config.json.")
+        to_address = (to_address or "").strip()
+        if "@" not in to_address:
+            return "That doesn't look like an email address."
+
+        message = EmailMessage()
+        message["Subject"] = f"[{self.config.club_name}] Test email"
+        message["From"] = self.config.smtp_from
+        message["To"] = to_address
+        message.set_content(
+            "This is a test from your tennis ladder.\n\n"
+            "If you're reading it, email is working: players who opt in will "
+            "get notifications about results and matches.\n"
+        )
+        try:
+            self._sender(message)
+        except Exception as exc:                 # noqa: BLE001
+            return f"Failed: {type(exc).__name__}: {exc}"
+        self.sent.append(message)
+        return f"Sent to {to_address}. If it doesn't arrive, check spam."
+
     def send_weekly_summary(self, lines: Sequence[str], subject: str) -> int:
         """Broadcast the weekly digest to everyone opted in. Returns count."""
         if not self.config.email_enabled:

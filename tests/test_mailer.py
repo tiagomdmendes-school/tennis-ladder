@@ -133,6 +133,49 @@ class TestOptIn(MailerTestCase):
         self.assertIn("List-Unsubscribe", message)
 
 
+class TestTestEmail(MailerTestCase):
+    """The setup aid: one email, sent now, with the real error if it fails.
+
+    Configuring SMTP otherwise means changing a file, restarting, waiting, and
+    guessing why nothing arrived. This turns that into one click and a
+    sentence.
+    """
+
+    def test_a_successful_send_says_so(self):
+        outcome = self.mailer.send_test("captain@example.edu")
+        self.assertTrue(outcome.startswith("Sent"))
+        self.assertEqual(self.recipients(), ["captain@example.edu"])
+
+    def test_the_smtp_error_is_reported_rather_than_swallowed(self):
+        """Everywhere else failures are swallowed so a dead mail server can't
+        break a result. Here the error is the entire point."""
+        def refuse(message):
+            raise OSError("[Errno 111] Connection refused")
+
+        self.mailer._sender = refuse
+        outcome = self.mailer.send_test("captain@example.edu")
+        self.assertTrue(outcome.startswith("Failed"))
+        self.assertIn("Connection refused", outcome)
+
+    def test_an_unconfigured_club_is_told_what_is_missing(self):
+        from ladder.mailer import Mailer
+        from tests.helpers import make_config
+
+        bare = Mailer(make_config(), self.db, sender=lambda m: None)
+        self.assertIn("smtp_host", bare.send_test("captain@example.edu"))
+
+    def test_a_bad_address_is_caught_before_sending(self):
+        self.assertIn("email address", self.mailer.send_test("not-an-address"))
+        self.assertEqual(self.outbox, [])
+
+    def test_it_ignores_notification_preferences(self):
+        """A test email is for the admin checking the plumbing, not a
+        notification -- opting out of everything must not silence it."""
+        for kind in ("confirm", "result", "weekly", "season"):
+            self.db.set_notification(self.al.id, kind, False)
+        self.assertTrue(self.mailer.send_test(self.al.email).startswith("Sent"))
+
+
 class TestUnsubscribeTokens(unittest.TestCase):
     def test_a_token_verifies_for_its_own_player_and_kind(self):
         token = unsubscribe_token("s3cret", 7, "confirm")
