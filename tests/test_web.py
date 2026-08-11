@@ -802,6 +802,114 @@ class TestScoreGridSubmission(WebTestCase):
         self.assertIn("Bo", body)
 
 
+class TestNavBadges(WebTestCase):
+    """Counts in the nav for things waiting on you.
+
+    A badge that doesn't clear when you deal with it trains people to ignore
+    badges, so each one counts only things the viewer can act on right now.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.roster()
+        self.login_as(self.al, self.al_pin)
+
+    def badge_for(self, body, label):
+        match = re.search(
+            r">%s<span class=\"badge\">(\d+)</span>" % label, body)
+        return int(match.group(1)) if match else 0
+
+    def test_no_badges_when_nothing_needs_you(self):
+        _, body, _ = self.get("/")
+        self.assertNotIn('class="badge"', body)
+
+    def test_a_result_awaiting_your_confirmation_shows_a_count(self):
+        self.app.service.submit_result(
+            division=MS, side_a=[self.bo.id], side_b=[self.al.id],
+            score_text="6-4", played_on=days_ago(1), submitted_by=self.bo.id)
+        _, body, _ = self.get("/")
+        self.assertEqual(self.badge_for(body, "Confirm"), 1)
+
+    def test_the_badge_clears_once_you_confirm(self):
+        self.app.service.submit_result(
+            division=MS, side_a=[self.bo.id], side_b=[self.al.id],
+            score_text="6-4", played_on=days_ago(1), submitted_by=self.bo.id)
+        match = self.db.list_matches(limit=1)[0]
+        self.post("/pending", {"csrf": self.csrf("/pending"),
+                               "match_id": match.id, "action": "confirm"})
+        _, body, _ = self.get("/")
+        self.assertEqual(self.badge_for(body, "Confirm"), 0)
+
+    def test_an_incoming_match_request_shows_on_matches(self):
+        when = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%dT%H:%M")
+        self.app.service.scheduler.request_match(
+            division=MS, from_player=self.bo.id, to_player=self.al.id,
+            starts_at=when)
+        _, body, _ = self.get("/")
+        self.assertEqual(self.badge_for(body, "Matches"), 1)
+
+    def test_your_own_outgoing_request_does_not_badge_you(self):
+        when = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%dT%H:%M")
+        self.app.service.scheduler.request_match(
+            division=MS, from_player=self.al.id, to_player=self.bo.id,
+            starts_at=when)
+        _, body, _ = self.get("/")
+        self.assertEqual(self.badge_for(body, "Matches"), 0)
+
+    def test_a_tournament_match_of_yours_badges_tournaments(self):
+        for day in (30, 25, 20):
+            self.app.service.submit_result(
+                division=MS, side_a=[self.al.id], side_b=[self.bo.id],
+                score_text="6-2", played_on=days_ago(day), auto_confirm=True)
+        self.app.service.create_tournament(
+            name="Cup", division=MS, style="elimination", seeding="ladder",
+            match_format="one_set",
+            player_ids=[self.al.id, self.bo.id, self.cy.id, self.dan.id])
+        _, body, _ = self.get("/")
+        self.assertGreaterEqual(self.badge_for(body, "Tournaments"), 1)
+
+    def test_signed_out_visitors_get_no_badges(self):
+        self.app.service.submit_result(
+            division=MS, side_a=[self.bo.id], side_b=[self.al.id],
+            score_text="6-4", played_on=days_ago(1), submitted_by=self.bo.id)
+        self.get("/logout")
+        _, body, _ = self.get("/")
+        self.assertNotIn('class="badge"', body)
+
+    def test_the_availability_tab_is_named_availability(self):
+        _, body, _ = self.get("/")
+        self.assertIn(">Availability<", body)
+        self.assertNotIn("My times", body)
+
+
+class TestWalkoverReveal(WebTestCase):
+    def setUp(self):
+        super().setUp()
+        self.roster()
+        self.login_as(self.al, self.al_pin)
+
+    def test_the_winner_picker_is_hidden_until_it_is_needed(self):
+        _, body, _ = self.get(f"/submit?division={MS}")
+        self.assertIn('id="whowon" hidden', body)
+
+    def test_the_winner_options_are_named_after_the_players(self):
+        _, body, _ = self.get(
+            f"/submit?division={MS}&a1={self.al.id}&b1={self.bo.id}")
+        picker = body[body.index('id="whowon"'):]
+        picker = picker[:picker.index("</select>")]
+        self.assertIn(">Al<", picker)
+        self.assertIn(">Bo<", picker)
+
+    def test_a_walkover_still_records_correctly(self):
+        self.post("/submit", {"csrf": self.csrf("/submit"), "division": MS,
+                              "a1": self.al.id, "b1": self.bo.id,
+                              "ending": "walkover", "winner_side": "b",
+                              "played_on": days_ago(1)})
+        match = self.db.list_matches(limit=1)[0]
+        self.assertTrue(match.walkover)
+        self.assertEqual(match.winners, [self.bo.id])
+
+
 class TestMobileLayout(WebTestCase):
     """Guards against the page scrolling sideways on a phone.
 

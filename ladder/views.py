@@ -61,6 +61,10 @@ nav { display:flex; gap:18px; flex-wrap:wrap; margin-left:auto; align-items:cent
 nav a { color:var(--ink-2); font-size:14px; }
 nav a.active { color:var(--ink); font-weight:600; }
 .who { font-size:13px; color:var(--muted); }
+.badge { display:inline-grid; place-items:center; min-width:17px; height:17px;
+  margin-left:5px; padding:0 5px; border-radius:999px; background:var(--critical);
+  color:#fff; font-size:11px; font-weight:700; line-height:1;
+  vertical-align:1px; font-variant-numeric:tabular-nums; }
 
 .divnav { display:flex; gap:6px; flex-wrap:wrap; margin:0 0 20px; }
 .divnav a { padding:6px 13px; border-radius:999px; font-size:13.5px;
@@ -236,16 +240,23 @@ def page(
     player: Optional[Player] = None,
     is_admin: bool = False,
     flashes: Sequence[tuple] = (),
+    badges: Optional[dict] = None,
 ) -> str:
+    badges = badges or {}
+
     def nav_link(href: str, key: str, label: str) -> str:
         cls = ' class="active"' if key == active else ""
-        return f'<a href="{href}"{cls}>{esc(label)}</a>'
+        count = badges.get(key) or 0
+        # A count rather than a bare dot: "2 to confirm" is worth acting on,
+        # a dot only tells you to go and look.
+        mark = f'<span class="badge">{count}</span>' if count else ""
+        return f'<a href="{href}"{cls}>{esc(label)}{mark}</a>'
 
     links = [
         nav_link("/", "ladder", "Ladders"),
         nav_link("/tournaments", "tournaments", "Tournaments"),
         nav_link("/schedule", "schedule", "Matches"),
-        nav_link("/availability", "availability", "My times"),
+        nav_link("/availability", "availability", "Availability"),
         nav_link("/submit", "submit", "Submit"),
         nav_link("/pending", "pending", "Confirm"),
         nav_link("/matches", "matches", "History"),
@@ -578,9 +589,9 @@ def score_grid(side_a_label: str, side_b_label: str, *, rows: int = 3,
     return f"""<div class="scoregrid" id="scoregrid">
   <div class="setrow head">
     <div class="setlabel"></div>
-    <div class="sidename">{esc(side_a_label)}</div>
+    <div class="sidename" id="sideAname">{esc(side_a_label)}</div>
     <span class="dash"></span>
-    <div class="sidename">{esc(side_b_label)}</div>
+    <div class="sidename" id="sideBname">{esc(side_b_label)}</div>
   </div>
   {''.join(lines)}
 </div>

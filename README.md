@@ -375,7 +375,7 @@ ladder/
   web.py / views.py  router, HTML, and the rating charts
   wsgi.py            entry point for gunicorn / PythonAnywhere
 tools/               seed_demo.py, ladderctl.py
-tests/               410 tests
+tests/               421 tests
 data/                ladder.db and config.json (created on first run)
 ```
 
@@ -395,7 +395,7 @@ Copy that one file and you have a complete backup.
 python3 -m unittest discover -s tests -t .
 ```
 
-410 tests, no dependencies.
+421 tests, no dependencies.
 
 **Run them on the Python your server actually has.** The deployed box runs 3.8
 (Ubuntu 20.04); development happens on 3.13. A backslash inside an f-string

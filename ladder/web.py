@@ -237,7 +237,41 @@ class App:
                   if req.session["player_id"] else None)
         return page(title, body, club=self.config.club_name, active=active,
                     player=player, is_admin=req.session["is_admin"],
-                    flashes=req.take_flashes())
+                    flashes=req.take_flashes(), badges=self.badges(player))
+
+    def badges(self, player) -> dict:
+        """Counts for the nav, so things needing you are visible from any page.
+
+        Only counts things the viewer can actually act on -- a badge that
+        doesn't clear when you deal with it trains people to ignore badges.
+        """
+        if not player:
+            return {}
+        counts = {}
+        try:
+            waiting = len(self.service.pending_for(player.id))
+            if waiting:
+                counts["pending"] = waiting
+
+            asked = len(self.service.scheduler.inbox(player.id))
+            if asked:
+                counts["schedule"] = asked
+
+            # Tournament matches that are yours to play right now.
+            ready = 0
+            for tournament in self.db.list_tournaments():
+                if tournament.status != "running":
+                    continue
+                for tmatch in self.db.tournament_matches(tournament.id):
+                    if (tmatch.winner_id is None and tmatch.is_ready
+                            and player.id in tmatch.players):
+                        ready += 1
+            if ready:
+                counts["tournaments"] = ready
+        except Exception:                       # noqa: BLE001
+            # A broken badge must never take a page down with it.
+            return {}
+        return counts
 
     def viewer(self, req: Request):
         pid = req.session["player_id"]
@@ -1760,16 +1794,60 @@ you played.</div></div>
   <option value="retired">Someone retired</option>
   <option value="walkover">Walkover &mdash; nobody played</option>
 </select>
-<div class="hint">For a retirement, enter the score up to the point it stopped.
-For a walkover, say who advanced below.</div></div>
+<div class="hint">For a retirement, enter the score up to the point it stopped.</div></div>
 
-<div><label for="winner_side">Who won? <span class="hint"
-     style="display:inline">only needed for a walkover</span></label>
+<div id="whowon" hidden><label for="winner_side">Who advanced?</label>
 <select id="winner_side" name="winner_side">
-  <option value="">Work it out from the score</option>
-  <option value="a">Side A</option>
-  <option value="b">Side B</option>
-</select></div>
+  <option value="">Pick one</option>
+  <option value="a">{esc(side_a_label)}</option>
+  <option value="b">{esc(side_b_label)}</option>
+</select>
+<div class="hint">Nobody played, so there's no score to work it out from.</div></div>
+<script>
+(function () {{
+  var ending = document.getElementById('ending');
+  var who = document.getElementById('whowon');
+  var grid = document.getElementById('scoregrid');
+  if (!ending || !who) return;
+  function sync() {{
+    var walkover = ending.value === 'walkover';
+    who.hidden = !walkover;
+    // A walkover has no score, so the grid only gets in the way.
+    if (grid) grid.hidden = walkover;
+  }}
+  ending.addEventListener('change', sync);
+  sync();
+}})();
+
+// Keep the score column headers matching the player dropdowns, so you can
+// see which column is yours before typing anything into it.
+(function () {{
+  var doubles = {'true' if is_doubles else 'false'};
+  function picked(name) {{
+    var el = document.querySelector('[name="' + name + '"]');
+    if (!el || !el.value) return null;
+    var text = el.options[el.selectedIndex].text.trim();
+    return text.indexOf('--') === 0 ? null : text;
+  }}
+  function label(one, two, fallback) {{
+    var names = [picked(one), picked(two)].filter(Boolean);
+    if (!names.length) return fallback;
+    if (names.length === 1) return doubles ? names[0] + ' & partner' : names[0];
+    return names.map(function (n) {{ return n.split(' ')[0]; }}).join(' & ');
+  }}
+  function sync() {{
+    var a = document.getElementById('sideAname');
+    var b = document.getElementById('sideBname');
+    if (a) a.textContent = label('a1', 'a2', 'Side A');
+    if (b) b.textContent = label('b1', 'b2', 'Side B');
+  }}
+  ['a1', 'a2', 'b1', 'b2'].forEach(function (name) {{
+    var el = document.querySelector('[name="' + name + '"]');
+    if (el) el.addEventListener('change', sync);
+  }});
+  sync();
+}})();
+</script>
 
 <div class="pair">
 <div><label for="played_on">Date played</label>
